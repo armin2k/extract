@@ -279,7 +279,7 @@ def merge_analysis_results(results, categories):
                         merged[year][category] = new_val
     return merged
 
-def analyze_document_in_batches(text_json, provider, categories, batch_size=2000, overlap=500):
+def analyze_document_in_batches(text_json, provider, categories, batch_size=10000, overlap=500):
     """
     Split the document text (wrapped in JSON) into overlapping batches (by character count)
     and analyze each batch concurrently.
