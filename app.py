@@ -279,7 +279,7 @@ def merge_analysis_results(results, categories):
                         merged[year][category] = new_val
     return merged
 
-def analyze_document_in_batches(text_json, provider, categories, batch_size=3000, overlap=500):
+def analyze_document_in_batches(text_json, provider, categories, batch_size=2000, overlap=500):
     """
     Split the document text (wrapped in JSON) into overlapping batches (by character count)
     and analyze each batch concurrently.
@@ -305,7 +305,7 @@ def analyze_document_in_batches(text_json, provider, categories, batch_size=3000
     results = []
     total_batches = len(batches)
     print(f"Processing {total_batches} batches concurrently...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_to_index = {
             executor.submit(analyze_with_api, wrap_text_in_json(batch), provider, categories): i+1
             for i, batch in enumerate(batches)
