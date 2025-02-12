@@ -12,10 +12,10 @@ from dotenv import load_dotenv
 import concurrent.futures
 from flask import Flask, request, render_template_string, send_from_directory, url_for
 
-# Load configurations from .env file
+# Load configurations from .env
 load_dotenv()
 
-# Configuration – Mac specific (adjust as needed)
+# Configuration – adjust as needed (for example, on macOS)
 POPPLER_PATH = os.getenv("POPPLER_PATH", "/opt/homebrew/bin")
 SCALE_FACTOR = int(os.getenv("SCALE_FACTOR", 1))
 CATEGORIES_FILE = "categories.json"
@@ -30,7 +30,7 @@ CATEGORIES = load_categories()
 def get_api_choice():
     """(For console use) Let user choose API provider."""
     print("\nChoose API provider:")
-    print("1. DeepSeek API (Ollama offline if OLLAMA_MODE=offline)")
+    print("1. DeepSeek API (via Ollama offline if OLLAMA_MODE=offline)")
     print("2. ChatGPT API")
     print("3. No AI analysis (text extraction only)")
     while True:
@@ -41,7 +41,7 @@ def get_api_choice():
 
 def extract_text(pdf_path):
     """
-    Extract text from a PDF using PyPDF2; if that fails, use OCR (optimized for Portuguese).
+    Extract text from a PDF using PyPDF2; if that fails, fall back to OCR (optimized for Portuguese).
     Returns the extracted text.
     """
     try:
@@ -66,7 +66,7 @@ def extract_text(pdf_path):
 
 def reorder_line(line, categories):
     """
-    If a line contains an expected category keyword, remove it from its current position and prepend it.
+    If a line contains one of the expected category keywords, remove it from its current position and prepend it.
     """
     found = None
     for cat in categories:
@@ -80,15 +80,14 @@ def reorder_line(line, categories):
 
 def clean_ocr_text(raw_text, categories):
     """
-    Clean the OCR-extracted text while preserving its original formatting.
+    Clean the OCR text while preserving formatting.
     Keeps only lines longer than 10 characters that contain at least one digit
     or one of the expected category keywords; also removes URLs.
     Each kept line is reordered so that the category appears at the beginning.
     """
     cleaned_lines = []
     for line in raw_text.splitlines():
-        # Remove URLs
-        line = re.sub(r"http\S+", "", line)
+        line = re.sub(r"http\S+", "", line)  # Remove URLs
         if len(line) > 10 and (re.search(r'\d', line.lstrip()) or any(cat.lower() in line.lower() for cat in categories)):
             cleaned_lines.append(reorder_line(line, categories))
     return "\n".join(cleaned_lines)
@@ -96,7 +95,7 @@ def clean_ocr_text(raw_text, categories):
 def wrap_text_in_json(text):
     """
     Wrap the cleaned OCR text in a JSON structure that preserves formatting.
-    The text is split into lines (preserving indents) and stored under the key "document" with a "lines" array.
+    Splits the text into lines and stores them in a "lines" array under "document".
     """
     lines = [line for line in text.splitlines() if line.strip() != ""]
     wrapped = {"document": {"lines": lines}}
@@ -104,9 +103,9 @@ def wrap_text_in_json(text):
 
 def parse_value(value):
     """
-    Convert Brazilian-formatted numbers (as strings) to a float.
+    Convert Brazilian-formatted numbers (as strings) to float.
     - Removes "R$" and extra whitespace.
-    - Normalizes minus signs (including en‑/em‑dashes) and detects negatives via a leading "-" or enclosed in parentheses.
+    - Normalizes minus signs (including en‑ and em‑dashes) and detects negatives (leading "-" or enclosed in parentheses).
     - Removes thousand separators and converts the decimal comma to a dot.
     - Applies SCALE_FACTOR.
     """
@@ -138,7 +137,7 @@ def parse_value(value):
 
 def extract_json_from_text(text):
     """
-    Extract a JSON block from text.
+    Extract a JSON block from the text.
     First, search for content enclosed in triple backticks; if not found, extract from the first "{" to the last "}".
     """
     candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
@@ -196,28 +195,22 @@ def format_financial_data(response_json, categories):
 def get_api_parameters(provider):
     """
     Return the API endpoint, headers, model, and timeout based on the chosen provider.
-    For DeepSeek, if OLLAMA_MODE=offline is set in the environment, use the local Ollama endpoint.
+    For ChatGPT, we now use "gpt-4o-mini".
     """
     if provider == "deepseek":
-        if os.getenv("OLLAMA_MODE", "online").lower() == "offline":
-            url = "http://localhost:11434/v1/chat/completions"  # Local Ollama endpoint
-            headers = {}  # No auth needed locally
-        else:
-            url = "https://api.deepseek.com/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"}
-        model = "deepseek-r1:7b"  # Use your specific DeepSeek model
-        timeout_value = 120
-    else:
+        # (Not used since you're only using ChatGPT in this case.)
+        pass
+    else:  # ChatGPT branch
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
-        model = "gpt-4o-mini"
-        timeout_value = 120
+        model = "gpt-4o-mini"  # Using gpt-4o-mini for ChatGPT
+        timeout_value = 180  # Increase timeout if needed
     return url, headers, model, timeout_value
 
 def analyze_with_api(text_json, provider, categories):
     """
     Analyze the provided OCR text (wrapped in JSON) using the chosen API.
-    The prompt instructs the model to extract the financial data from the structured document.
+    The prompt instructs the model to extract only the financial data from the structured document.
     """
     prompt = f"""
 Você é um especialista em contabilidade brasileira. A seguir, é fornecido um balanço patrimonial extraído por OCR, com a formatação preservada num objeto JSON.
@@ -248,13 +241,9 @@ Documento (em JSON):
             response_json = response.json()
             return format_financial_data(response_json, categories)
         except requests.exceptions.Timeout:
-            if attempt < retries - 1:
-                print(f"Timeout - Retrying ({attempt+1}/{retries})...")
-                time.sleep(5)
-                continue
-            else:
-                print("API timeout after 3 attempts")
-                return None
+            print(f"Timeout - Retrying ({attempt+1}/{retries})...")
+            time.sleep(5)
+            continue
         except Exception as e:
             print(f"API Error: {str(e)}")
             return None
@@ -281,10 +270,11 @@ def merge_analysis_results(results, categories):
 
 def analyze_document_in_batches(text_json, provider, categories, batch_size=10000, overlap=500):
     """
-    Split the document text (wrapped in JSON) into overlapping batches (by character count)
-    and analyze each batch concurrently.
-    Returns the merged JSON analysis.
+    Split the wrapped OCR JSON text into overlapping batches (by character count)
+    and analyze each batch sequentially (to reduce memory usage).
+    Returns a tuple: (merged JSON analysis, batch processing logs)
     """
+    logs = []
     try:
         doc_data = json.loads(text_json)
         if isinstance(doc_data.get("document"), dict) and "lines" in doc_data["document"]:
@@ -292,8 +282,8 @@ def analyze_document_in_batches(text_json, provider, categories, batch_size=1000
         else:
             doc = doc_data.get("document", "")
     except Exception as e:
-        print(f"Error loading wrapped JSON: {e}")
-        return None
+        logs.append(f"Error loading wrapped JSON: {e}")
+        return None, "\n".join(logs)
 
     batches = []
     start = 0
@@ -301,11 +291,13 @@ def analyze_document_in_batches(text_json, provider, categories, batch_size=1000
         end = start + batch_size
         batches.append(doc[start:end])
         start = end - overlap
+    logs.append(f"Created {len(batches)} batches (batch_size={batch_size}, overlap={overlap}).")
 
     results = []
     total_batches = len(batches)
-    print(f"Processing {total_batches} batches concurrently...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    logs.append(f"Processing {total_batches} batches sequentially (max_workers=1).")
+    # Use a single worker to process batches sequentially.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future_to_index = {
             executor.submit(analyze_with_api, wrap_text_in_json(batch), provider, categories): i+1
             for i, batch in enumerate(batches)
@@ -316,15 +308,18 @@ def analyze_document_in_batches(text_json, provider, categories, batch_size=1000
                 result = future.result()
                 if result:
                     results.append(result)
+                    logs.append(f"Batch {i} processed successfully.")
                 else:
-                    print(f"Warning: No result from batch {i}.")
+                    logs.append(f"Warning: No result from batch {i}.")
             except Exception as exc:
-                print(f"Batch {i} generated an exception: {exc}")
+                logs.append(f"Batch {i} generated an exception: {exc}")
     if results:
         merged_result = merge_analysis_results(results, categories)
-        return merged_result
+        logs.append("Merged results from batches successfully.")
+        return merged_result, "\n".join(logs)
     else:
-        return None
+        logs.append("No results were obtained from any batches.")
+        return None, "\n".join(logs)
 
 # --- Flask Web Application ---
 
@@ -332,7 +327,6 @@ app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# HTML template for uploading files with improved layout and a progress indicator
 UPLOAD_HTML = """
 <!doctype html>
 <html lang="en">
@@ -344,6 +338,7 @@ UPLOAD_HTML = """
     .container { width: 80%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
     h2 { color: #333; }
     form { margin-top: 20px; }
+    label { display: block; margin-bottom: 5px; }
     input[type="file"], select { padding: 10px; width: 100%; margin-bottom: 15px; }
     input[type="submit"] { padding: 10px 20px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
     input[type="submit"]:hover { background: #45a049; }
@@ -351,6 +346,11 @@ UPLOAD_HTML = """
     .progress p { font-size: 16px; color: #555; }
     .progress progress { width: 100%; height: 20px; }
   </style>
+  <script>
+    function showProgress() {
+      document.getElementById("progressDiv").style.display = "block";
+    }
+  </script>
 </head>
 <body>
 <div class="container">
@@ -360,8 +360,8 @@ UPLOAD_HTML = """
     <input type="file" name="file" id="file">
     <label for="provider">Select API Provider:</label>
     <select name="provider" id="provider">
-      <option value="chatgpt">ChatGPT API</option>
-      <option value="deepseek">DeepSeek API (Ollama offline if OLLAMA_MODE=offline)</option>
+      <option value="chatgpt">ChatGPT API (gpt-4o-mini)</option>
+      <option value="deepseek">DeepSeek API (via Ollama offline)</option>
     </select>
     <input type="submit" value="Upload">
   </form>
@@ -370,16 +370,10 @@ UPLOAD_HTML = """
     <progress value="0" max="100" id="progressBar"></progress>
   </div>
 </div>
-<script>
-  function showProgress() {
-    document.getElementById("progressDiv").style.display = "block";
-  }
-</script>
 </body>
 </html>
 """
 
-# HTML template for displaying the result with download links (without displaying the JSON text)
 RESULT_HTML = """
 <!doctype html>
 <html lang="en">
@@ -391,6 +385,7 @@ RESULT_HTML = """
     .container { width: 80%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); text-align: center; }
     a { display: block; margin: 15px 0; font-size: 18px; color: #4CAF50; text-decoration: none; }
     a:hover { text-decoration: underline; }
+    pre { background: #f9f9f9; border: 1px solid #ddd; padding: 10px; text-align: left; overflow-x: auto; font-size: 14px; }
   </style>
 </head>
 <body>
@@ -405,6 +400,8 @@ RESULT_HTML = """
   {% if download_xls_link %}
     <a href="{{ download_xls_link }}">Download Analysis XLS File</a>
   {% endif %}
+  <h3>Batch Processing Logs</h3>
+  <pre>{{ batch_logs }}</pre>
   <br>
   <a href="/">Upload another file</a>
 </div>
@@ -438,19 +435,19 @@ def upload():
     with open(json_text_path, "w", encoding="utf-8") as f:
         f.write(wrapped_json)
     
-    # Use batch processing if text is long
-    if len(cleaned_text) > 2000:
-        result = analyze_document_in_batches(wrapped_json, provider, CATEGORIES, batch_size=2000, overlap=500)
+    # Decide whether to use batch processing
+    if len(cleaned_text) > 10000:
+        result, batch_logs = analyze_document_in_batches(wrapped_json, provider, CATEGORIES, batch_size=10000, overlap=500)
     else:
         result = analyze_with_api(wrapped_json, provider, CATEGORIES)
+        batch_logs = "Single API call used (no batch processing)."
     
-    # Save analysis result files
+    # Save analysis result files if available
     if result:
         analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
         with open(analysis_json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False, default=lambda x: "NaN" if math.isnan(x) else x)
         # Convert the result JSON to an Excel file with years as columns and categories as rows.
-        # We first create a DataFrame with years as index, then transpose it.
         df = pd.DataFrame.from_dict(result, orient="index").T
         analysis_xls_path = os.path.join("output", f"{filename}_analysis.xlsx")
         df.to_excel(analysis_xls_path)
@@ -462,12 +459,14 @@ def upload():
         download_analysis_link = None
         download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
         download_xls_link = None
+        batch_logs += "\nNo analysis result obtained."
     
     return render_template_string(RESULT_HTML,
                                   filename=filename,
                                   download_analysis_link=download_analysis_link,
                                   download_ocr_link=download_ocr_link,
-                                  download_xls_link=download_xls_link)
+                                  download_xls_link=download_xls_link,
+                                  batch_logs=batch_logs)
 
 @app.route("/download/<path:filename>")
 def download_file(filename):
