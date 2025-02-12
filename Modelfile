@@ -1,0 +1,5 @@
+FROM deepseek-r1:14b
+PARAMETER use_metal true
+PARAMETER num_ctx 2048
+PARAMETER num_batch 1
+PARAMETER num_thread 8
