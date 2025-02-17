@@ -193,18 +193,17 @@ def format_financial_data(response_json, categories):
         return None
 
 def get_api_parameters(provider):
-    """
-    Return the API endpoint, headers, model, and timeout based on the chosen provider.
-    For ChatGPT, we now use "gpt-4o-mini".
-    """
     if provider == "deepseek":
-        # (Not used since you're only using ChatGPT in this case.)
-        pass
+        # For deepseek via Ollama offline
+        url = "http://localhost:11434/v1/chat/completions"
+        headers = {}  # No authentication needed for local Ollama
+        model = "deepseek-r1:14b"  # Or change to your desired model
+        timeout_value = 240
     else:  # ChatGPT branch
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
-        model = "gpt-4o-mini"  # Using gpt-4o-mini for ChatGPT
-        timeout_value = 180  # Increase timeout if needed
+        model = "gpt-4o-mini"
+        timeout_value = 180
     return url, headers, model, timeout_value
 
 def analyze_with_api(text_json, provider, categories):
@@ -297,7 +296,7 @@ def analyze_document_in_batches(text_json, provider, categories, batch_size=1000
     total_batches = len(batches)
     logs.append(f"Processing {total_batches} batches sequentially (max_workers=1).")
     # Use a single worker to process batches sequentially.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         future_to_index = {
             executor.submit(analyze_with_api, wrap_text_in_json(batch), provider, categories): i+1
             for i, batch in enumerate(batches)
