@@ -24,6 +24,10 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs("output", exist_ok=True)
 CATEGORIES_FILE = "categories.json"
 
+
+
+
+
 def load_categories():
     try:
         with open(CATEGORIES_FILE, encoding="utf-8") as f:

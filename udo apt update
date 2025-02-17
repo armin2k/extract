@@ -1,0 +1,19 @@
+[0;1;32m●[0m extract.service - Gunicorn instance to serve the Extract Flask app
+     Loaded: loaded (]8;;file://srv723602/etc/systemd/system/extract.service/etc/systemd/system/extract.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: [0;1;32mactive (running)[0m since Wed 2025-02-12 22:52:09 UTC; 1s ago
+   Main PID: 14109 (gunicorn)
+      Tasks: 1 (limit: 4657)
+     Memory: 13.6M (peak: 13.8M)
+        CPU: 101ms
+     CGroup: /system.slice/extract.service
+             └─[0;38;5;245m14109 /root/extract/venv/bin/python3 /root/extract/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8000 app:app[0m
+
+Feb 12 22:51:58 srv723602 systemd[1]: [0;1;39m[0;1;31m[0;1;39mextract.service: Main process exited, code=exited, status=1/FAILURE[0m
+Feb 12 22:51:58 srv723602 systemd[1]: [0;1;38;5;185m[0;1;39m[0;1;38;5;185mextract.service: Failed with result 'exit-code'.[0m
+Feb 12 22:52:08 srv723602 systemd[1]: extract.service: Scheduled restart job, restart counter is at 50.
+Feb 12 22:52:09 srv723602 systemd[1]: Started extract.service - Gunicorn instance to serve the Extract Flask app.
+Feb 12 22:52:09 srv723602 gunicorn[14109]: [2025-02-12 22:52:09 +0000] [14109] [INFO] Starting gunicorn 23.0.0
+Feb 12 22:52:09 srv723602 gunicorn[14109]: [2025-02-12 22:52:09 +0000] [14109] [ERROR] Connection in use: ('127.0.0.1', 8000)
+Feb 12 22:52:09 srv723602 gunicorn[14109]: [2025-02-12 22:52:09 +0000] [14109] [ERROR] connection to ('127.0.0.1', 8000) failed: [Errno 98] Address already in use
+Feb 12 22:52:10 srv723602 gunicorn[14109]: [2025-02-12 22:52:10 +0000] [14109] [ERROR] Connection in use: ('127.0.0.1', 8000)
+Feb 12 22:52:10 srv723602 gunicorn[14109]: [2025-02-12 22:52:10 +0000] [14109] [ERROR] connection to ('127.0.0.1', 8000) failed: [Errno 98] Address already in use
