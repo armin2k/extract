@@ -1,8 +1,9 @@
 # app.py
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-import os
-import json
 import math
+import json
 import logging
 import pandas as pd
 from flask import Flask, request, render_template_string, send_from_directory, url_for
@@ -14,27 +15,24 @@ from pdf_processor import extract_text
 from ocr_utils import clean_ocr_text, wrap_pages_in_json
 from api_integration import analyze_with_api, analyze_document_in_batches
 
-# Load environment variables and set up logging
+# Load environment variables and configure logging
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# Configuration
-UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs("output", exist_ok=True)
 CATEGORIES_FILE = "categories.json"
 
-
-
-
-
-def load_categories():
+def load_categories() -> list:
     try:
         with open(CATEGORIES_FILE, encoding="utf-8") as f:
             data = json.load(f)
-            return data["categories"]
+            return data.get("categories", [])
     except Exception as e:
-        logging.error(f"Failed to load categories: {e}")
+        logger.exception("Failed to load categories: %s", e)
         return []
 
 CATEGORIES = load_categories()
@@ -121,86 +119,76 @@ RESULT_HTML = """
 </html>
 """
 
-app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(UPLOAD_HTML)
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    if "file" not in request.files:
-        return "No file part", 400
-    file = request.files["file"]
-    if file.filename == "":
-        return "No selected file", 400
-    if not file.filename.lower().endswith(".pdf"):
-        return "Only PDF files are allowed.", 400
-
-    provider = request.form.get("provider", "chatgpt")
-    filename = secure_filename(file.filename)
-    upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    file.save(upload_path)
-    
-    logging.info(f"File {filename} saved to {upload_path}.")
-
-    # Process the PDF into a list of page texts.
-    raw_pages = extract_text(upload_path)
-    # Clean each page separately.
-    cleaned_pages = [clean_ocr_text(page, CATEGORIES) for page in raw_pages]
-    # Wrap the cleaned pages into a structured JSON.
-    wrapped_json = wrap_pages_in_json(cleaned_pages)
-    
-    # Save OCR output for download.
-    json_text_path = os.path.join("output", f"{filename}_ocr.json")
     try:
+        if "file" not in request.files:
+            return "No file part", 400
+        file = request.files["file"]
+        if file.filename == "":
+            return "No selected file", 400
+        if not file.filename.lower().endswith(".pdf"):
+            return "Only PDF files are allowed.", 400
+
+        provider = request.form.get("provider", "chatgpt")
+        filename = secure_filename(file.filename)
+        upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(upload_path)
+        logger.info(f"File {filename} saved to {upload_path}.")
+
+        # Process the PDF into a list of page texts.
+        raw_pages = extract_text(upload_path)
+        cleaned_pages = [clean_ocr_text(page, CATEGORIES) for page in raw_pages]
+        wrapped_json = wrap_pages_in_json(cleaned_pages)
+        
+        # Save OCR output for download.
+        json_text_path = os.path.join("output", f"{filename}_ocr.json")
         with open(json_text_path, "w", encoding="utf-8") as f:
             f.write(wrapped_json)
-    except Exception as e:
-        logging.error(f"Error writing OCR JSON file: {e}")
-
-    # Decide whether to use batch processing for API analysis.
-    total_text_length = sum(len(page) for page in cleaned_pages)
-    if total_text_length > 10000:
-        result, batch_logs = analyze_document_in_batches(wrapped_json, provider, CATEGORIES, batch_size=10000, overlap=500)
-    else:
-        result = analyze_with_api(wrapped_json, provider, CATEGORIES)
-        batch_logs = "Single API call used (no batch processing)."
-    
-    if result:
-        analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
-        try:
+        
+        # Decide whether to use batch processing based on total text length.
+        total_text_length = sum(len(page) for page in cleaned_pages)
+        if total_text_length > 10000:
+            result, batch_logs = analyze_document_in_batches(wrapped_json, provider, CATEGORIES, batch_size=10000, overlap=500)
+        else:
+            result = analyze_with_api(wrapped_json, provider, CATEGORIES)
+            batch_logs = "Single API call used (no batch processing)."
+        
+        if result:
+            analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
             with open(analysis_json_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, ensure_ascii=False, default=lambda x: "NaN" if math.isnan(x) else x)
-        except Exception as e:
-            logging.error(f"Error writing analysis JSON file: {e}")
-        try:
             df = pd.DataFrame.from_dict(result, orient="index").T
             analysis_xls_path = os.path.join("output", f"{filename}_analysis.xlsx")
             df.to_excel(analysis_xls_path)
-        except Exception as e:
-            logging.error(f"Error writing analysis XLS file: {e}")
+            
+            download_analysis_link = url_for("download_file", filename=f"{filename}_analysis.json")
+            download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
+            download_xls_link = url_for("download_file", filename=f"{filename}_analysis.xlsx")
+        else:
+            download_analysis_link = None
+            download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
+            download_xls_link = None
+            batch_logs += "\nNo analysis result obtained."
         
-        download_analysis_link = url_for("download_file", filename=f"{filename}_analysis.json")
-        download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
-        download_xls_link = url_for("download_file", filename=f"{filename}_analysis.xlsx")
-    else:
-        download_analysis_link = None
-        download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
-        download_xls_link = None
-        batch_logs += "\nNo analysis result obtained."
-    
-    return render_template_string(RESULT_HTML,
-                                  filename=filename,
-                                  download_analysis_link=download_analysis_link,
-                                  download_ocr_link=download_ocr_link,
-                                  download_xls_link=download_xls_link,
-                                  batch_logs=batch_logs)
+        return render_template_string(RESULT_HTML,
+                                      filename=filename,
+                                      download_analysis_link=download_analysis_link,
+                                      download_ocr_link=download_ocr_link,
+                                      download_xls_link=download_xls_link,
+                                      batch_logs=batch_logs)
+    except Exception as e:
+        logger.exception("Error processing uploaded file:")
+        return "Internal Server Error", 500
 
 @app.route("/download/<path:filename>")
 def download_file(filename: str):
     return send_from_directory("output", filename, as_attachment=True)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Run on all interfaces so that Nginx can access it.
+    app.run(host="0.0.0.0", port=8000)
