@@ -8,7 +8,7 @@ import requests
 import concurrent.futures
 from tenacity import retry, wait_exponential, stop_after_attempt
 from data_parser import format_financial_data, merge_analysis_results
-from ocr_utils import wrap_text_in_json
+from ocr_utils import wrap_pages_in_json
 
 def get_api_parameters(provider: str) -> tuple:
     """
@@ -98,7 +98,7 @@ def analyze_document_in_batches(text_json: str, provider: str, categories: list,
     logs.append(f"Processing {total_batches} batches concurrently (max_workers={max_workers}).")
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_index = {
-            executor.submit(analyze_with_api, wrap_text_in_json(batch), provider, categories): i+1
+            executor.submit(analyze_with_api, wrap_pages_in_json(batch), provider, categories): i+1
             for i, batch in enumerate(batches)
         }
         for future in concurrent.futures.as_completed(future_to_index):
