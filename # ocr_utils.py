@@ -1,8 +1,8 @@
 # ocr_utils.py
 
 import re
-from PIL import Image, ImageEnhance, ImageFilter
 import json
+from PIL import Image, ImageEnhance, ImageFilter
 
 def preprocess_image(img: Image.Image) -> Image.Image:
     """
@@ -11,22 +11,22 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     """
     gray = img.convert('L')
     enhancer = ImageEnhance.Contrast(gray)
-    gray = enhancer.enhance(2)  # Adjust contrast factor as needed
+    gray = enhancer.enhance(2)  # Adjust as needed
     gray = gray.filter(ImageFilter.MedianFilter())
     return gray
 
 def post_process_text(text: str) -> str:
     """
-    Correct common OCR misinterpretations.
-    For example, replace an uppercase 'O' with zero in numeric contexts.
+    Apply post-processing corrections to the OCR text.
+    For example, replace common misinterpretations (like "O" in numeric contexts).
     """
     text = re.sub(r'(?<=\d)O(?=\d)', '0', text)
     return text
 
 def reorder_line(line: str, categories: list) -> str:
     """
-    If a line contains one of the expected category keywords, remove it from its 
-    current position and prepend it. This standardizes the line format.
+    If a line contains one of the expected category keywords,
+    remove it from its current position and prepend it.
     """
     found = None
     for cat in categories:
@@ -53,10 +53,14 @@ def clean_ocr_text(raw_text: str, categories: list) -> str:
             cleaned_lines.append(reorder_line(line, categories))
     return "\n".join(cleaned_lines)
 
-def wrap_text_in_json(text: str) -> str:
+def wrap_pages_in_json(pages: list) -> str:
     """
-    Wrap the cleaned text into a JSON structure that preserves the document's formatting.
+    Wrap a list of page texts into a JSON structure.
+    Each page becomes an object with its page number and its list of nonempty lines.
     """
-    lines = [line for line in text.splitlines() if line.strip() != ""]
-    wrapped = {"document": {"lines": lines}}
-    return json.dumps(wrapped, ensure_ascii=False, indent=2)
+    doc = {"document": {"pages": []}}
+    for idx, page_text in enumerate(pages, start=1):
+        # Split page text into lines and remove any empty lines.
+        lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+        doc["document"]["pages"].append({"page_number": idx, "lines": lines})
+    return json.dumps(doc, ensure_ascii=False, indent=2)
