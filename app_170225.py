@@ -10,119 +10,75 @@ from pdf2image import convert_from_path
 import pytesseract
 from dotenv import load_dotenv
 import concurrent.futures
-import logging
 from flask import Flask, request, render_template_string, send_from_directory, url_for
-from werkzeug.utils import secure_filename  # For secure file names
-from PIL import Image, ImageEnhance, ImageFilter  # For image pre-processing
-from tenacity import retry, wait_exponential, stop_after_attempt  # For exponential backoff
 
-# -------------------------------
-# Configuration and Logging Setup
-# -------------------------------
+# Load configurations from .env
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-# External configuration values from .env file
+# Configuration – adjust as needed (for example, on macOS)
 POPPLER_PATH = os.getenv("POPPLER_PATH", "/opt/homebrew/bin")
 SCALE_FACTOR = int(os.getenv("SCALE_FACTOR", 1))
 CATEGORIES_FILE = "categories.json"
 
-def load_categories() -> list:
-    """Load categories from a JSON file."""
-    try:
-        with open(CATEGORIES_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-            return data["categories"]
-    except Exception as e:
-        logging.error(f"Failed to load categories: {e}")
-        return []
+def load_categories():
+    """Load categories from JSON file."""
+    with open(CATEGORIES_FILE, encoding="utf-8") as f:
+        return json.load(f)["categories"]
 
 CATEGORIES = load_categories()
 
-# Precompile regex patterns for categories to speed up matching
-CATEGORY_PATTERNS = [(cat, re.compile(re.escape(cat), re.IGNORECASE)) for cat in CATEGORIES]
+def get_api_choice():
+    """(For console use) Let user choose API provider."""
+    print("\nChoose API provider:")
+    print("1. DeepSeek API (via Ollama offline if OLLAMA_MODE=offline)")
+    print("2. ChatGPT API")
+    print("3. No AI analysis (text extraction only)")
+    while True:
+        choice = input("Enter 1, 2, or 3: ").strip()
+        if choice in ["1", "2", "3"]:
+            return {"1": "deepseek", "2": "chatgpt", "3": None}[choice]
+        print("Invalid choice. Please try again.")
 
-# -------------------------------
-# Image Pre-processing Functions
-# -------------------------------
-def preprocess_image(img: Image.Image) -> Image.Image:
+def extract_text(pdf_path):
     """
-    Pre-process the PIL image to improve OCR results.
-    Converts to grayscale, enhances contrast, and applies a median filter.
-    """
-    gray = img.convert('L')
-    enhancer = ImageEnhance.Contrast(gray)
-    gray = enhancer.enhance(2)
-    gray = gray.filter(ImageFilter.MedianFilter())
-    return gray
-
-def post_process_text(text: str) -> str:
-    """
-    Apply post-processing corrections to the OCR text.
-    For example, replace common misinterpretations.
-    """
-    # Replace an uppercase 'O' with zero '0' in numeric contexts.
-    text = re.sub(r'(?<=\d)O(?=\d)', '0', text)
-    return text
-
-# -------------------------------
-# PDF and OCR Processing Functions
-# -------------------------------
-def extract_text(pdf_path: str) -> str:
-    """
-    Extract text from a PDF using PyPDF2; if that fails, fall back to OCR.
-    Iterates page by page to reduce memory usage.
+    Extract text from a PDF using PyPDF2; if that fails, fall back to OCR (optimized for Portuguese).
     Returns the extracted text.
     """
-    text = ""
     try:
         with open(pdf_path, "rb") as f:
             reader = PdfReader(f)
-            # Process one page at a time
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                text += page_text + "\n"
+            text = "\n".join([page.extract_text() or "" for page in reader.pages])
             if len(text.strip()) > 100:
                 return text
     except Exception as e:
-        logging.error(f"Standard extraction failed: {e}")
-
-    # If standard extraction fails, use OCR
+        print(f"Standard extraction failed: {str(e)}")
     try:
-        # Increase DPI for better resolution (300 DPI recommended)
-        images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH, dpi=300)
+        images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH)
         ocr_text = []
         custom_config = "--psm 6 --oem 3"
         for img in images:
-            processed_img = preprocess_image(img)
-            text_img = pytesseract.image_to_string(processed_img, lang='por', config=custom_config)
-            text_img = post_process_text(text_img)
+            text_img = pytesseract.image_to_string(img, lang='por', config=custom_config)
             ocr_text.append(text_img)
         return "\n".join(ocr_text)
     except Exception as e:
-        logging.error(f"OCR failed: {e}")
+        print(f"OCR failed: {str(e)}")
         return ""
 
-def reorder_line(line: str, categories: list) -> str:
+def reorder_line(line, categories):
     """
-    If a line contains one of the expected category keywords,
-    remove it from its current position and prepend it.
+    If a line contains one of the expected category keywords, remove it from its current position and prepend it.
     """
     found = None
-    for cat, pattern in CATEGORY_PATTERNS:
-        if pattern.search(line):
+    for cat in categories:
+        if re.search(re.escape(cat), line, re.IGNORECASE):
             found = cat
-            line = pattern.sub('', line, count=1)
+            line = re.sub(re.escape(cat), '', line, flags=re.IGNORECASE)
             break
     if found:
         line = found + " " + line
     return re.sub(r'\s+', ' ', line).strip()
 
-def clean_ocr_text(raw_text: str, categories: list) -> str:
+def clean_ocr_text(raw_text, categories):
     """
     Clean the OCR text while preserving formatting.
     Keeps only lines longer than 10 characters that contain at least one digit
@@ -136,7 +92,7 @@ def clean_ocr_text(raw_text: str, categories: list) -> str:
             cleaned_lines.append(reorder_line(line, categories))
     return "\n".join(cleaned_lines)
 
-def wrap_text_in_json(text: str) -> str:
+def wrap_text_in_json(text):
     """
     Wrap the cleaned OCR text in a JSON structure that preserves formatting.
     Splits the text into lines and stores them in a "lines" array under "document".
@@ -145,13 +101,13 @@ def wrap_text_in_json(text: str) -> str:
     wrapped = {"document": {"lines": lines}}
     return json.dumps(wrapped, ensure_ascii=False, indent=2)
 
-# -------------------------------
-# Data Parsing Functions
-# -------------------------------
-def parse_value(value) -> float:
+def parse_value(value):
     """
     Convert Brazilian-formatted numbers (as strings) to float.
-    Applies the SCALE_FACTOR.
+    - Removes "R$" and extra whitespace.
+    - Normalizes minus signs (including en‑ and em‑dashes) and detects negatives (leading "-" or enclosed in parentheses).
+    - Removes thousand separators and converts the decimal comma to a dot.
+    - Applies SCALE_FACTOR.
     """
     if value in [None, "NaN", ""]:
         return math.nan
@@ -176,14 +132,13 @@ def parse_value(value) -> float:
         return num * SCALE_FACTOR
     try:
         return float(value) * SCALE_FACTOR
-    except Exception:
+    except:
         return math.nan
 
-def extract_json_from_text(text: str) -> str:
+def extract_json_from_text(text):
     """
     Extract a JSON block from the text.
-    Searches for content enclosed in triple backticks; if not found,
-    extracts from the first "{" to the last "}".
+    First, search for content enclosed in triple backticks; if not found, extract from the first "{" to the last "}".
     """
     candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     for candidate in candidates:
@@ -200,30 +155,29 @@ def extract_json_from_text(text: str) -> str:
             json.loads(candidate)
             return candidate
         except json.JSONDecodeError:
-            logging.error("Failed to decode JSON from extracted candidate.")
             return None
     return None
 
-def format_financial_data(response_json: dict, categories: list) -> dict:
+def format_financial_data(response_json, categories):
     """
     Convert the API response into a structured JSON object.
-    If the API returns a flat dictionary (with keys matching the categories),
-    wrap it under "Ano Desconhecido".
+    If the API returns a flat dictionary (with keys matching the categories), wrap it under "Ano Desconhecido".
     """
     try:
         content = response_json.get('choices', [{}])[0].get('message', {}).get('content', '')
         if not content.strip():
-            logging.error("Formatting error: API returned empty content.")
+            print("Formatting error: API returned empty content.")
             return None
         json_text = extract_json_from_text(content)
         if not json_text:
-            logging.error("Formatting error: Could not extract JSON content from the response.")
-            logging.error("Raw response snippet: %s", content[:500])
+            print("Formatting error: Could not extract JSON content from the response.")
+            print("Raw response snippet:")
+            print(content[:500])
             return None
         try:
             raw_data = json.loads(json_text)
         except json.JSONDecodeError as jde:
-            logging.error("Formatting error: Failed to decode JSON. Error: %s", jde)
+            print(f"Formatting error: Failed to decode JSON.\nExtracted content:\n{json_text}\nError: {jde}")
             return None
         if any(key in categories for key in raw_data.keys()):
             raw_data = {"Ano Desconhecido": raw_data}
@@ -235,46 +189,27 @@ def format_financial_data(response_json: dict, categories: list) -> dict:
                 formatted[year][category] = parse_value(raw_value)
         return formatted
     except Exception as e:
-        logging.error(f"Formatting error: {e}")
+        print(f"Formatting error: {str(e)}")
         return None
 
-# -------------------------------
-# API Integration Functions with Retry
-# -------------------------------
-def get_api_parameters(provider: str) -> tuple:
-    """
-    Returns API parameters (URL, headers, model, timeout) based on the chosen provider.
-    Checks that necessary environment variables are set.
-    """
+def get_api_parameters(provider):
     if provider == "deepseek":
+        # For deepseek via Ollama offline
         url = "http://localhost:11434/v1/chat/completions"
-        headers = {}
-        model = "deepseek-r1:14b"
+        headers = {}  # No authentication needed for local Ollama
+        model = "deepseek-r1:14b"  # Or change to your desired model
         timeout_value = 240
     else:  # ChatGPT branch
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key:
-            logging.error("OPENAI_API_KEY is not set in environment variables.")
         url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {api_key}"}
+        headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
         model = "gpt-4o-mini"
         timeout_value = 180
     return url, headers, model, timeout_value
 
-@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
-def make_api_call(url: str, headers: dict, payload: dict, timeout_value: int) -> dict:
-    """
-    Make an API call with the given parameters.
-    This function is decorated with tenacity to retry on transient errors.
-    """
-    response = requests.post(url, headers=headers, json=payload, timeout=timeout_value)
-    if response.status_code != 200:
-        raise Exception(f"API call failed with status code {response.status_code}: {response.text}")
-    return response.json()
-
-def analyze_with_api(text_json: str, provider: str, categories: list) -> dict:
+def analyze_with_api(text_json, provider, categories):
     """
     Analyze the provided OCR text (wrapped in JSON) using the chosen API.
+    The prompt instructs the model to extract only the financial data from the structured document.
     """
     prompt = f"""
 Você é um especialista em contabilidade brasileira. A seguir, é fornecido um balanço patrimonial extraído por OCR, com a formatação preservada num objeto JSON.
@@ -289,19 +224,30 @@ Documento (em JSON):
 {text_json}
     """
     url, headers, model, timeout_value = get_api_parameters(provider)
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1
-    }
-    try:
-        response_json = make_api_call(url, headers, payload, timeout_value)
-        return format_financial_data(response_json, categories)
-    except Exception as e:
-        logging.error(f"API Error: {e}")
-        return None
+    retries = 3
+    for attempt in range(retries):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1
+                },
+                timeout=timeout_value
+            )
+            response_json = response.json()
+            return format_financial_data(response_json, categories)
+        except requests.exceptions.Timeout:
+            print(f"Timeout - Retrying ({attempt+1}/{retries})...")
+            time.sleep(5)
+            continue
+        except Exception as e:
+            print(f"API Error: {str(e)}")
+            return None
 
-def merge_analysis_results(results: list, categories: list) -> dict:
+def merge_analysis_results(results, categories):
     """
     Merge multiple API responses (each a dict with year keys) into one JSON object.
     For each accounting year, non-NaN values are preferred.
@@ -321,10 +267,10 @@ def merge_analysis_results(results: list, categories: list) -> dict:
                         merged[year][category] = new_val
     return merged
 
-def analyze_document_in_batches(text_json: str, provider: str, categories: list, batch_size: int = 10000, overlap: int = 500) -> tuple:
+def analyze_document_in_batches(text_json, provider, categories, batch_size=10000, overlap=500):
     """
     Split the wrapped OCR JSON text into overlapping batches (by character count)
-    and analyze each batch concurrently.
+    and analyze each batch sequentially (to reduce memory usage).
     Returns a tuple: (merged JSON analysis, batch processing logs)
     """
     logs = []
@@ -348,10 +294,9 @@ def analyze_document_in_batches(text_json: str, provider: str, categories: list,
 
     results = []
     total_batches = len(batches)
-    # Dynamically set max_workers based on system capabilities.
-    max_workers = min(32, (os.cpu_count() or 1) * 2)
-    logs.append(f"Processing {total_batches} batches concurrently (max_workers={max_workers}).")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    logs.append(f"Processing {total_batches} batches sequentially (max_workers=1).")
+    # Use a single worker to process batches sequentially.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         future_to_index = {
             executor.submit(analyze_with_api, wrap_text_in_json(batch), provider, categories): i+1
             for i, batch in enumerate(batches)
@@ -375,13 +320,11 @@ def analyze_document_in_batches(text_json: str, provider: str, categories: list,
         logs.append("No results were obtained from any batches.")
         return None, "\n".join(logs)
 
-# -------------------------------
-# Flask Web Application
-# -------------------------------
+# --- Flask Web Application ---
+
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-os.makedirs("output", exist_ok=True)
 
 UPLOAD_HTML = """
 <!doctype html>
@@ -476,46 +419,37 @@ def upload():
     file = request.files["file"]
     if file.filename == "":
         return "No selected file", 400
-    if not file.filename.lower().endswith(".pdf"):
-        return "Only PDF files are allowed.", 400
-
     provider = request.form.get("provider", "chatgpt")
-    filename = secure_filename(file.filename)
+    filename = file.filename
     upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(upload_path)
     
-    logging.info(f"File {filename} saved to {upload_path}.")
-
+    # Process the PDF
     raw_text = extract_text(upload_path)
     cleaned_text = clean_ocr_text(raw_text, CATEGORIES)
     wrapped_json = wrap_text_in_json(cleaned_text)
     
+    os.makedirs("output", exist_ok=True)
     json_text_path = os.path.join("output", f"{filename}_ocr.json")
-    try:
-        with open(json_text_path, "w", encoding="utf-8") as f:
-            f.write(wrapped_json)
-    except Exception as e:
-        logging.error(f"Error writing OCR JSON file: {e}")
+    with open(json_text_path, "w", encoding="utf-8") as f:
+        f.write(wrapped_json)
     
+    # Decide whether to use batch processing
     if len(cleaned_text) > 10000:
         result, batch_logs = analyze_document_in_batches(wrapped_json, provider, CATEGORIES, batch_size=10000, overlap=500)
     else:
         result = analyze_with_api(wrapped_json, provider, CATEGORIES)
         batch_logs = "Single API call used (no batch processing)."
     
+    # Save analysis result files if available
     if result:
         analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
-        try:
-            with open(analysis_json_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, indent=2, ensure_ascii=False, default=lambda x: "NaN" if math.isnan(x) else x)
-        except Exception as e:
-            logging.error(f"Error writing analysis JSON file: {e}")
-        try:
-            df = pd.DataFrame.from_dict(result, orient="index").T
-            analysis_xls_path = os.path.join("output", f"{filename}_analysis.xlsx")
-            df.to_excel(analysis_xls_path)
-        except Exception as e:
-            logging.error(f"Error writing analysis XLS file: {e}")
+        with open(analysis_json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False, default=lambda x: "NaN" if math.isnan(x) else x)
+        # Convert the result JSON to an Excel file with years as columns and categories as rows.
+        df = pd.DataFrame.from_dict(result, orient="index").T
+        analysis_xls_path = os.path.join("output", f"{filename}_analysis.xlsx")
+        df.to_excel(analysis_xls_path)
         
         download_analysis_link = url_for("download_file", filename=f"{filename}_analysis.json")
         download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
@@ -534,7 +468,7 @@ def upload():
                                   batch_logs=batch_logs)
 
 @app.route("/download/<path:filename>")
-def download_file(filename: str):
+def download_file(filename):
     return send_from_directory("output", filename, as_attachment=True)
 
 if __name__ == "__main__":
