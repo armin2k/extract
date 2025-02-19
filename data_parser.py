@@ -2,45 +2,32 @@
 import json
 import math
 import logging
-from ocr_utils import extract_json_from_text  # Assuming you have a helper to extract JSON from text
+from ocr_utils import extract_json_from_text  # Ensure this exists in ocr_utils.py
 
 logger = logging.getLogger(__name__)
-
-# You may have a SCALE_FACTOR defined elsewhere; set it here if not.
-SCALE_FACTOR = 1
+SCALE_FACTOR = 1  # Adjust as necessary
 
 def parse_value(value):
     """
-    Convert a Brazilian-formatted number string to a float.
-    If the value is a dict (unexpected), try to extract a numeric value from it.
+    Convert a Brazilian-formatted number (as a string or number) to a float.
+    If the value is a dict:
+      - If it has exactly one key, use its value.
+      - Otherwise, log a warning and return NaN.
     """
-    # If value is a dict, attempt to extract its numeric content.
     if isinstance(value, dict):
-        # Option 1: If the dict has a 'value' key, use that.
-        if 'value' in value:
-            value = value['value']
-        # Option 2: If the dict has exactly one key, use its value.
-        elif len(value) == 1:
+        if len(value) == 1:
             value = next(iter(value.values()))
         else:
-            # If the dict has multiple keys, log a warning and return NaN.
             logger.warning("Multiple keys in value dict: %s. Returning NaN.", value)
             return math.nan
-    # Now attempt to convert to float.
     if value in [None, "", "NaN"]:
         return math.nan
-    if isinstance(value, str):
-        try:
-            # Remove "R$", spaces, etc. Adjust for Brazilian number formats if needed.
-            value = value.replace("R$", "").strip()
-            # Remove any thousand separators and replace decimal comma with dot.
-            value = value.replace(".", "").replace(",", ".")
-            num = float(value)
-            return num * SCALE_FACTOR
-        except Exception as e:
-            logger.exception("Error converting value %s: %s", value, e)
-            return math.nan
     try:
+        if isinstance(value, str):
+            # Remove any currency symbols and spaces.
+            value = value.replace("R$", "").strip()
+            # Remove thousand separators and replace decimal comma with dot.
+            value = value.replace(".", "").replace(",", ".")
         return float(value) * SCALE_FACTOR
     except Exception as e:
         logger.exception("Error converting value %s: %s", value, e)
@@ -49,9 +36,10 @@ def parse_value(value):
 def format_financial_data(response_json, categories):
     """
     Convert the API response into a structured JSON object.
-    Expects the API to return a JSON block containing financial data.
-    If the returned data is flat and matches categories, it wraps it under "Ano Desconhecido".
-    Then, it parses each value using parse_value.
+    - Extracts JSON text from the response content.
+    - If raw_data is flat (keys matching categories), wraps it under "Ano Desconhecido".
+    - Then for each year and category, parses the value with parse_value.
+    Handles cases where the value might be a simple number or a dict.
     """
     try:
         content = response_json.get('choices', [{}])[0].get('message', {}).get('content', '')
@@ -63,15 +51,26 @@ def format_financial_data(response_json, categories):
             logger.error("Could not extract JSON from API response.")
             return None
         raw_data = json.loads(json_text)
-        # If raw_data is flat and keys match categories, wrap it under "Ano Desconhecido"
+        # Wrap flat data in a default key if needed.
         if any(key in categories for key in raw_data.keys()):
             raw_data = {"Ano Desconhecido": raw_data}
         formatted = {}
         for year, data in raw_data.items():
             formatted[year] = {}
             for category in categories:
-                raw_value = data.get(category, math.nan)
-                formatted[year][category] = parse_value(raw_value)
+                # If data is not a dict, assume it's a simple value.
+                if isinstance(data, dict):
+                    raw_value = data.get(category, math.nan)
+                else:
+                    raw_value = data
+                if not isinstance(raw_value, dict):
+                    formatted[year][category] = parse_value(raw_value)
+                else:
+                    if len(raw_value) == 1:
+                        formatted[year][category] = parse_value(next(iter(raw_value.values())))
+                    else:
+                        logger.warning("Multiple keys in value dict for category '%s': %s. Returning NaN.", category, raw_value)
+                        formatted[year][category] = math.nan
         return formatted
     except Exception as e:
         logger.exception("Error formatting financial data: %s", e)
@@ -80,7 +79,7 @@ def format_financial_data(response_json, categories):
 def merge_analysis_results(results, categories):
     """
     Merge multiple analysis result dictionaries.
-    For each year, prefer non-NaN values from the new results.
+    For each accounting year, use non-NaN values from later results if available.
     """
     merged = {}
     for result in results:
@@ -97,12 +96,18 @@ def merge_analysis_results(results, categories):
                         merged[year][category] = new_val
     return merged
 
+# The following helper function attempts to extract a JSON block from a text string.
 def extract_json_from_text(text):
     """
     Attempt to extract a JSON block from the text.
-    This can be implemented by looking for content within triple backticks or from the first '{' to the last '}'.
+    Looks first for content enclosed in triple backticks (optionally with "json"),
+    then falls back to extracting from the first '{' to the last '}'.
+    Returns the extracted JSON string if successful, or None if not found.
     """
     import re
+    import json
+
+    # Look for triple backticks encapsulating JSON
     candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     for candidate in candidates:
         try:
@@ -110,6 +115,8 @@ def extract_json_from_text(text):
             return candidate
         except json.JSONDecodeError:
             continue
+
+    # Fallback: extract from first '{' to last '}'
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1:
