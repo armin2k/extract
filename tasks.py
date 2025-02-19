@@ -4,6 +4,11 @@ import json
 import logging
 import math
 from celery import Celery
+from dotenv import load_dotenv
+
+# Load environment variables from .env file.
+load_dotenv()
+
 from pdf_processor import extract_text
 from ocr_utils import clean_ocr_text, wrap_pages_in_json, extract_company_info_from_text
 from api_integration import analyze_with_api, analyze_document_in_batches
@@ -29,7 +34,7 @@ def process_balance_sheet(self, filename, upload_path, provider, categories):
         cleaned_pages = [clean_ocr_text(page, categories) for page in raw_pages]
         wrapped_json = wrap_pages_in_json(cleaned_pages)
         
-        # 2. Analyze the document using API
+        # 2. Analyze the document using the API
         total_text_length = sum(len(page) for page in cleaned_pages)
         if total_text_length > 10000:
             result, batch_logs = analyze_document_in_batches(wrapped_json, provider, categories, batch_size=10000, overlap=500)
@@ -72,7 +77,7 @@ def process_balance_sheet(self, filename, upload_path, provider, categories):
             logger.info("Added new record for company %s.", company_name)
         db.close()
         
-        # Optionally, update the task state with processing details
+        # Optionally, update the task state with processing details.
         self.update_state(state="SUCCESS", meta={"record_id": record_id, "status": "Processing complete!", "current": 1, "total": 1, "processing_time": 1})
         return {"record_id": record_id, "meta": {"status": "Processing complete!", "current": 1, "total": 1, "processing_time": 1}}
     except Exception as e:
