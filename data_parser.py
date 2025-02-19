@@ -1,78 +1,69 @@
 # data_parser.py
-import math
 import json
-import re
+import math
 import logging
-from typing import Any, Dict
+from ocr_utils import extract_json_from_text  # Assuming you have a helper to extract JSON from text
 
 logger = logging.getLogger(__name__)
 
-def parse_value(value: Any) -> float:
+# You may have a SCALE_FACTOR defined elsewhere; set it here if not.
+SCALE_FACTOR = 1
+
+def parse_value(value):
     """
-    Convert a Brazilian-formatted number (as string) to a float.
+    Convert a Brazilian-formatted number string to a float.
+    If the value is a dict (unexpected), try to extract a numeric value from it.
     """
-    try:
-        if value in [None, "NaN", ""]:
+    # If value is a dict, attempt to extract its numeric content.
+    if isinstance(value, dict):
+        # Option 1: If the dict has a 'value' key, use that.
+        if 'value' in value:
+            value = value['value']
+        # Option 2: If the dict has exactly one key, use its value.
+        elif len(value) == 1:
+            value = next(iter(value.values()))
+        else:
+            # If the dict has multiple keys, log a warning and return NaN.
+            logger.warning("Multiple keys in value dict: %s. Returning NaN.", value)
             return math.nan
-        if isinstance(value, str):
-            value = value.replace('R$', '').strip()
-            value = value.replace('–', '-').replace('—', '-')
-            negative = False
-            if value.startswith('-'):
-                negative = True
-                value = value[1:].strip()
-            if value.startswith('(') and value.endswith(')'):
-                negative = True
-                value = value[1:-1].strip()
-            value = value.replace(' ', '')
-            value = value.replace('.', '').replace(',', '.')
+    # Now attempt to convert to float.
+    if value in [None, "", "NaN"]:
+        return math.nan
+    if isinstance(value, str):
+        try:
+            # Remove "R$", spaces, etc. Adjust for Brazilian number formats if needed.
+            value = value.replace("R$", "").strip()
+            # Remove any thousand separators and replace decimal comma with dot.
+            value = value.replace(".", "").replace(",", ".")
             num = float(value)
-            if negative:
-                num = -num
-            SCALE_FACTOR = 1  # Adjust if needed
             return num * SCALE_FACTOR
-        return float(value)
+        except Exception as e:
+            logger.exception("Error converting value %s: %s", value, e)
+            return math.nan
+    try:
+        return float(value) * SCALE_FACTOR
     except Exception as e:
-        logger.exception("Error parsing value %s: %s", value, e)
+        logger.exception("Error converting value %s: %s", value, e)
         return math.nan
 
-def extract_json_from_text(text: str) -> str:
-    """
-    Extract a JSON block from text.
-    """
-    try:
-        candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-        for candidate in candidates:
-            try:
-                json.loads(candidate)
-                return candidate
-            except json.JSONDecodeError:
-                continue
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1:
-            candidate = text[start:end+1]
-            json.loads(candidate)
-            return candidate
-        return ""
-    except Exception as e:
-        logger.exception("Error extracting JSON: %s", e)
-        return ""
-
-def format_financial_data(response_json: Dict[str, Any], categories: list) -> Dict[str, Any]:
+def format_financial_data(response_json, categories):
     """
     Convert the API response into a structured JSON object.
+    Expects the API to return a JSON block containing financial data.
+    If the returned data is flat and matches categories, it wraps it under "Ano Desconhecido".
+    Then, it parses each value using parse_value.
     """
     try:
         content = response_json.get('choices', [{}])[0].get('message', {}).get('content', '')
         if not content.strip():
-            logger.error("API returned empty content.")
-            return {}
+            logger.error("Empty content in API response.")
+            return None
         json_text = extract_json_from_text(content)
         if not json_text:
             logger.error("Could not extract JSON from API response.")
-            return {}
+            return None
         raw_data = json.loads(json_text)
+        # If raw_data is flat and keys match categories, wrap it under "Ano Desconhecido"
         if any(key in categories for key in raw_data.keys()):
             raw_data = {"Ano Desconhecido": raw_data}
         formatted = {}
@@ -84,27 +75,48 @@ def format_financial_data(response_json: Dict[str, Any], categories: list) -> Di
         return formatted
     except Exception as e:
         logger.exception("Error formatting financial data: %s", e)
-        return {}
+        return None
 
-def merge_analysis_results(results: list, categories: list) -> Dict[str, Any]:
+def merge_analysis_results(results, categories):
     """
-    Merge multiple API responses into one JSON object.
+    Merge multiple analysis result dictionaries.
+    For each year, prefer non-NaN values from the new results.
     """
     merged = {}
-    try:
-        for result in results:
-            if not result:
-                continue
-            for year, data in result.items():
-                if year not in merged:
-                    merged[year] = data
-                else:
-                    for category in categories:
-                        current_val = merged[year].get(category, math.nan)
-                        new_val = data.get(category, math.nan)
-                        if math.isnan(current_val) and not math.isnan(new_val):
-                            merged[year][category] = new_val
-        return merged
-    except Exception as e:
-        logger.exception("Error merging analysis results: %s", e)
-        return merged
+    for result in results:
+        if not result:
+            continue
+        for year, data in result.items():
+            if year not in merged:
+                merged[year] = data.copy()
+            else:
+                for category in categories:
+                    current_val = merged[year].get(category, math.nan)
+                    new_val = data.get(category, math.nan)
+                    if math.isnan(current_val) and not math.isnan(new_val):
+                        merged[year][category] = new_val
+    return merged
+
+def extract_json_from_text(text):
+    """
+    Attempt to extract a JSON block from the text.
+    This can be implemented by looking for content within triple backticks or from the first '{' to the last '}'.
+    """
+    import re
+    candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    for candidate in candidates:
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            continue
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1:
+        candidate = text[start:end+1]
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            return None
+    return None
