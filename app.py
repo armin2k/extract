@@ -43,7 +43,7 @@ def load_categories() -> list:
 CATEGORIES = load_categories()
 
 # --------------------------
-# HTML Templates using Bootstrap
+# HTML Templates (using Bootstrap)
 # --------------------------
 
 UPLOAD_HTML = """
@@ -53,11 +53,8 @@ UPLOAD_HTML = """
   <meta charset="utf-8">
   <title>Balance Sheet Analyzer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- Bootstrap CSS -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-  <style>
-    body { padding-top: 60px; }
-  </style>
+  <style> body { padding-top: 60px; } </style>
 </head>
 <body>
 <nav class="navbar navbar-expand-lg navbar-light bg-light fixed-top">
@@ -96,7 +93,6 @@ UPLOAD_HTML = """
     <p id="estimatedTime" class="mt-2"></p>
   </div>
 </div>
-<!-- Bootstrap JS -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
   function showProgress() {
@@ -114,7 +110,6 @@ PROCESSING_HTML = """
   <meta charset="utf-8">
   <title>Processing Balance Sheet</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- Bootstrap CSS -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body>
@@ -173,7 +168,6 @@ PROCESSING_HTML = """
     pollTaskStatus("{{ task_id }}");
   </script>
 </div>
-<!-- Bootstrap JS -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
@@ -186,7 +180,6 @@ SEARCH_HTML = """
   <meta charset="utf-8">
   <title>Search Balance Sheets</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- Bootstrap CSS -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body>
@@ -217,7 +210,6 @@ SEARCH_HTML = """
   <br>
   <a href="/" class="btn btn-secondary">Back to Home</a>
 </div>
-<!-- Bootstrap JS -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
@@ -230,7 +222,6 @@ RESULTS_HTML = """
   <meta charset="utf-8">
   <title>Search Results</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- Bootstrap CSS -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
     .action-link { color: blue; text-decoration: underline; cursor: pointer; }
@@ -281,7 +272,6 @@ RESULTS_HTML = """
   <a href="/search" class="btn btn-secondary">Back to Search</a>
   <a href="/" class="btn btn-primary">Back to Home</a>
 </div>
-<!-- Bootstrap JS -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
@@ -294,7 +284,6 @@ VIEW_HTML = """
   <meta charset="utf-8">
   <title>Balance Sheet Detail</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- Bootstrap CSS -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body>
@@ -349,7 +338,6 @@ VIEW_HTML = """
   <a href="/search" class="btn btn-secondary">Back to Search</a>
   <a href="/" class="btn btn-primary">Back to Home</a>
 </div>
-<!-- Bootstrap JS -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
@@ -380,7 +368,6 @@ def upload():
         file.save(upload_path)
         logger.info(f"File {filename} saved to {upload_path}.")
 
-        # Enqueue the processing task via Celery.
         task = process_balance_sheet.delay(filename, upload_path, provider, CATEGORIES)
         return render_template_string(PROCESSING_HTML, task_id=task.id)
     except Exception as e:
@@ -442,6 +429,6 @@ def view_sheet(sheet_id: int):
         return "Record not found", 404
 
 if __name__ == "__main__":
-    init_db()  # Initialize database (create tables, etc.)
-    app.debug = True  # Enable debug mode for development (disable in production)
+    init_db()  # Create tables if they do not exist.
+    app.debug = True  # Enable debug mode for development.
     app.run(host="0.0.0.0", port=8000)

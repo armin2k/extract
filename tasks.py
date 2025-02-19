@@ -6,14 +6,17 @@ import math
 from celery import Celery
 from dotenv import load_dotenv
 
-# Load environment variables from .env file.
+# Load environment variables from .env
 load_dotenv()
 
 from pdf_processor import extract_text
 from ocr_utils import clean_ocr_text, wrap_pages_in_json, extract_company_info_from_text
 from api_integration import analyze_with_api, analyze_document_in_batches
-from db import SessionLocal
+from db import SessionLocal, init_db
 from models import BalanceSheet
+
+# Initialize the database (create tables if they don't exist)
+init_db()
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -29,7 +32,7 @@ celery = Celery(
 @celery.task(bind=True)
 def process_balance_sheet(self, filename, upload_path, provider, categories):
     try:
-        # 1. Extract text from PDF using pdf_processor
+        # 1. Extract text from PDF
         raw_pages = extract_text(upload_path)
         cleaned_pages = [clean_ocr_text(page, categories) for page in raw_pages]
         wrapped_json = wrap_pages_in_json(cleaned_pages)
@@ -42,7 +45,7 @@ def process_balance_sheet(self, filename, upload_path, provider, categories):
             result = analyze_with_api(wrapped_json, provider, categories)
             batch_logs = "Single API call used (no batch processing)."
         
-        # 3. Extract company information from OCR text
+        # 3. Extract company info from OCR text
         all_text = "\n".join(cleaned_pages)
         company_info = extract_company_info_from_text(all_text)
         company_name = company_info.get("company_name", "")
@@ -77,7 +80,7 @@ def process_balance_sheet(self, filename, upload_path, provider, categories):
             logger.info("Added new record for company %s.", company_name)
         db.close()
         
-        # Optionally, update the task state with processing details.
+        # Update task state with processing details
         self.update_state(state="SUCCESS", meta={"record_id": record_id, "status": "Processing complete!", "current": 1, "total": 1, "processing_time": 1})
         return {"record_id": record_id, "meta": {"status": "Processing complete!", "current": 1, "total": 1, "processing_time": 1}}
     except Exception as e:
