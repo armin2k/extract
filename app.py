@@ -1,4 +1,3 @@
-# app.py
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
@@ -10,10 +9,14 @@ from flask import Flask, request, render_template_string, send_from_directory, u
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
-# Import our modules
+# Import custom modules
 from pdf_processor import extract_text
 from ocr_utils import clean_ocr_text, wrap_pages_in_json
 from api_integration import analyze_with_api, analyze_document_in_batches
+
+# Import database setup and model
+from db import init_db, SessionLocal
+from models import BalanceSheet
 
 # Load environment variables and configure logging
 load_dotenv()
@@ -24,9 +27,11 @@ app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs("output", exist_ok=True)
+
 CATEGORIES_FILE = "categories.json"
 
 def load_categories() -> list:
+    """Load balance sheet categories from a JSON file."""
     try:
         with open(CATEGORIES_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -37,6 +42,7 @@ def load_categories() -> list:
 
 CATEGORIES = load_categories()
 
+# HTML templates for upload and result pages
 UPLOAD_HTML = """
 <!doctype html>
 <html lang="en">
@@ -126,6 +132,7 @@ def index():
 @app.route("/upload", methods=["POST"])
 def upload():
     try:
+        # 1. Validate and save the uploaded file
         if "file" not in request.files:
             return "No file part", 400
         file = request.files["file"]
@@ -140,17 +147,17 @@ def upload():
         file.save(upload_path)
         logger.info(f"File {filename} saved to {upload_path}.")
 
-        # Process the PDF into a list of page texts.
+        # 2. Process the PDF: extract pages, clean them, and wrap into JSON
         raw_pages = extract_text(upload_path)
         cleaned_pages = [clean_ocr_text(page, CATEGORIES) for page in raw_pages]
         wrapped_json = wrap_pages_in_json(cleaned_pages)
         
-        # Save OCR output for download.
+        # Save the OCR JSON for download
         json_text_path = os.path.join("output", f"{filename}_ocr.json")
         with open(json_text_path, "w", encoding="utf-8") as f:
             f.write(wrapped_json)
         
-        # Decide whether to use batch processing based on total text length.
+        # 3. Analyze the document using the API
         total_text_length = sum(len(page) for page in cleaned_pages)
         if total_text_length > 10000:
             result, batch_logs = analyze_document_in_batches(wrapped_json, provider, CATEGORIES, batch_size=10000, overlap=500)
@@ -158,7 +165,15 @@ def upload():
             result = analyze_with_api(wrapped_json, provider, CATEGORIES)
             batch_logs = "Single API call used (no batch processing)."
         
+        # 4. Save the analysis result to the database (if available)
         if result:
+            db = SessionLocal()  # Open a database session
+            new_sheet = BalanceSheet(filename=filename, data=json.dumps(result))
+            db.add(new_sheet)
+            db.commit()
+            db.close()
+
+            # Save analysis result files for download
             analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
             with open(analysis_json_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, ensure_ascii=False, default=lambda x: "NaN" if math.isnan(x) else x)
@@ -190,5 +205,5 @@ def download_file(filename: str):
     return send_from_directory("output", filename, as_attachment=True)
 
 if __name__ == "__main__":
-    # Run on all interfaces so that Nginx can access it.
+    init_db()  # Initialize the database and create tables if they don't exist.
     app.run(host="0.0.0.0", port=8000)
