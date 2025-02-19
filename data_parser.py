@@ -2,37 +2,20 @@
 import json
 import math
 import logging
-from ocr_utils import extract_json_from_text  # Make sure this is defined in ocr_utils.py
+from ocr_utils import extract_json_from_text  # Ensure this is defined in ocr_utils.py
 
 logger = logging.getLogger(__name__)
-SCALE_FACTOR = 1  # Adjust as needed
+SCALE_FACTOR = 1  # Adjust if necessary
 
 def parse_value(value):
     """
     Convert a Brazilian-formatted number (as a string or number) to a float.
-    If the value is a dict:
-      - If it has exactly one key, use that value.
-      - If it has multiple keys and the keys are numeric (i.e. years), choose the value corresponding to the highest year.
-      - Otherwise, fall back to the first key's value.
+    If the value is a dict, this function should not be called directly;
+    instead, the caller should iterate over its values.
     """
-    if isinstance(value, dict):
-        try:
-            # Try to interpret keys as years (integers)
-            numeric_keys = {}
-            for k, v in value.items():
-                try:
-                    numeric_keys[int(k)] = v
-                except Exception:
-                    continue
-            if numeric_keys:
-                max_year = max(numeric_keys.keys())
-                value = numeric_keys[max_year]
-            else:
-                # If not all keys are numeric, use the first value
-                value = next(iter(value.values()))
-        except Exception as e:
-            logger.warning("Error processing dict value %s: %s. Using first value.", value, e)
-            value = next(iter(value.values()))
+    # If the value is already a number (int/float), return it.
+    if isinstance(value, (int, float)):
+        return float(value) * SCALE_FACTOR
     if value in [None, "", "NaN"]:
         return math.nan
     try:
@@ -49,10 +32,12 @@ def parse_value(value):
 def format_financial_data(response_json, categories):
     """
     Convert the API response into a structured JSON object.
-    - Extract JSON text from the API response.
-    - If the returned raw data is flat (its keys do not represent years), wrap it under "Ano Desconhecido."
-    - Otherwise, if all keys are numeric (representing years), preserve that structure.
-    - For each year and category, parse the value using parse_value.
+    
+    - Extracts the JSON block from the API response.
+    - If the raw data is flat (keys do not represent years), wraps it under "Ano Desconhecido".
+    - If the raw data already has year keys, that structure is preserved.
+    - For each year and each category, if the value is a dictionary (i.e. multi-year sub-values),
+      each inner value is converted using parse_value. Otherwise, the value is converted directly.
     """
     try:
         content = response_json.get('choices', [{}])[0].get('message', {}).get('content', '')
@@ -63,13 +48,14 @@ def format_financial_data(response_json, categories):
         if not json_text:
             logger.error("Could not extract JSON from API response.")
             return None
+        
         raw_data = json.loads(json_text)
-        # Determine if keys represent years.
-        if all(isinstance(k, str) and k.isdigit() for k in raw_data.keys()):
-            # Already multi-year data, do nothing.
-            pass
+        # Determine if the raw data keys represent years.
+        if isinstance(raw_data, dict) and all(isinstance(k, str) and k.strip().isdigit() for k in raw_data.keys()):
+            # Data is multi-year; preserve structure.
+            multi_year = True
         else:
-            # Otherwise, assume the data is flat and wrap it.
+            multi_year = False
             raw_data = {"Ano Desconhecido": raw_data}
         
         formatted = {}
@@ -80,7 +66,12 @@ def format_financial_data(response_json, categories):
                     raw_value = data.get(category, math.nan)
                 else:
                     raw_value = data
-                formatted[year][category] = parse_value(raw_value)
+                # If the raw_value itself is a dictionary, process each inner value.
+                if isinstance(raw_value, dict):
+                    formatted_value = {subkey: parse_value(subval) for subkey, subval in raw_value.items()}
+                else:
+                    formatted_value = parse_value(raw_value)
+                formatted[year][category] = formatted_value
         return formatted
     except Exception as e:
         logger.exception("Error formatting financial data: %s", e)
@@ -89,7 +80,7 @@ def format_financial_data(response_json, categories):
 def merge_analysis_results(results, categories):
     """
     Merge multiple analysis result dictionaries.
-    For each year, if a value is NaN in the merged data and a non-NaN value exists in a new result,
+    For each year and category, if the current merged value is NaN and a new result provides a non-NaN value,
     update the merged data.
     """
     merged = {}
@@ -103,21 +94,28 @@ def merge_analysis_results(results, categories):
                 for category in categories:
                     current_val = merged[year].get(category, math.nan)
                     new_val = data.get(category, math.nan)
-                    if math.isnan(current_val) and not math.isnan(new_val):
+                    # If current value is a simple number and new_val is a number, use new_val if current is NaN.
+                    if not isinstance(current_val, dict) and math.isnan(current_val) and not math.isnan(new_val):
                         merged[year][category] = new_val
+                    # If both are dicts, merge them (here simply prefer non-NaN new values)
+                    elif isinstance(current_val, dict) and isinstance(new_val, dict):
+                        for subkey, subval in new_val.items():
+                            if math.isnan(current_val.get(subkey, math.nan)) and not math.isnan(subval):
+                                merged[year][category][subkey] = subval
     return merged
 
 def extract_json_from_text(text):
     """
     Attempt to extract a JSON block from the text.
-    Looks first for content enclosed in triple backticks (optionally with "json"),
+    
+    This function looks first for content enclosed in triple backticks (optionally with "json"),
     then falls back to extracting from the first '{' to the last '}'.
-    Returns the extracted JSON string if successful, or None if not found.
+    Returns the extracted JSON string if successful, or None if no valid JSON is found.
     """
     import re
     import json
 
-    # Look for triple backticks encapsulating JSON.
+    # Look for triple backticks encapsulating JSON
     candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     for candidate in candidates:
         try:
@@ -126,7 +124,7 @@ def extract_json_from_text(text):
         except json.JSONDecodeError:
             continue
 
-    # Fallback: extract from first '{' to last '}'
+    # Fallback: Extract from first '{' to last '}'
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1:
