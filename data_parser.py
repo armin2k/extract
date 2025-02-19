@@ -2,29 +2,38 @@
 import json
 import math
 import logging
-from ocr_utils import extract_json_from_text  # Ensure this exists in ocr_utils.py
+from ocr_utils import extract_json_from_text  # Ensure this function is defined in ocr_utils.py
 
 logger = logging.getLogger(__name__)
-SCALE_FACTOR = 1  # Adjust as necessary
+SCALE_FACTOR = 1  # Adjust as needed
 
 def parse_value(value):
     """
     Convert a Brazilian-formatted number (as a string or number) to a float.
     If the value is a dict:
-      - If it has exactly one key, use its value.
-      - Otherwise, log a warning and return NaN.
+      - If it has exactly one key, use that value.
+      - If it has multiple keys and the keys represent years (numeric), choose the value corresponding to the highest year.
+      - Otherwise, fall back to the first key's value.
     """
     if isinstance(value, dict):
-        if len(value) == 1:
+        try:
+            # Try to convert keys to integers (assuming they are years)
+            year_keys = {int(k): v for k, v in value.items() if k.isdigit() or k.isnumeric()}
+            if year_keys:
+                # Choose the value for the maximum year
+                max_year = max(year_keys.keys())
+                value = year_keys[max_year]
+            else:
+                # If not all keys are numeric, simply pick the first key's value
+                value = next(iter(value.values()))
+        except Exception as e:
+            logger.warning("Error processing dict value %s: %s. Using first value.", value, e)
             value = next(iter(value.values()))
-        else:
-            logger.warning("Multiple keys in value dict: %s. Returning NaN.", value)
-            return math.nan
     if value in [None, "", "NaN"]:
         return math.nan
     try:
         if isinstance(value, str):
-            # Remove any currency symbols and spaces.
+            # Remove currency symbols and spaces
             value = value.replace("R$", "").strip()
             # Remove thousand separators and replace decimal comma with dot.
             value = value.replace(".", "").replace(",", ".")
@@ -36,10 +45,10 @@ def parse_value(value):
 def format_financial_data(response_json, categories):
     """
     Convert the API response into a structured JSON object.
-    - Extracts JSON text from the response content.
-    - If raw_data is flat (keys matching categories), wraps it under "Ano Desconhecido".
-    - Then for each year and category, parses the value with parse_value.
-    Handles cases where the value might be a simple number or a dict.
+    - Extract JSON text from the response content.
+    - If the returned raw data is flat and keys match categories, wrap it under "Ano Desconhecido".
+    - For each year and category, parse the value using parse_value.
+    This version handles both simple numbers and dictionaries.
     """
     try:
         content = response_json.get('choices', [{}])[0].get('message', {}).get('content', '')
@@ -51,26 +60,19 @@ def format_financial_data(response_json, categories):
             logger.error("Could not extract JSON from API response.")
             return None
         raw_data = json.loads(json_text)
-        # Wrap flat data in a default key if needed.
+        # If raw_data is flat (keys matching categories), wrap it under a default key.
         if any(key in categories for key in raw_data.keys()):
             raw_data = {"Ano Desconhecido": raw_data}
         formatted = {}
         for year, data in raw_data.items():
             formatted[year] = {}
+            # Check if data is a dictionary; if not, treat it as a single value for each category.
             for category in categories:
-                # If data is not a dict, assume it's a simple value.
                 if isinstance(data, dict):
                     raw_value = data.get(category, math.nan)
                 else:
                     raw_value = data
-                if not isinstance(raw_value, dict):
-                    formatted[year][category] = parse_value(raw_value)
-                else:
-                    if len(raw_value) == 1:
-                        formatted[year][category] = parse_value(next(iter(raw_value.values())))
-                    else:
-                        logger.warning("Multiple keys in value dict for category '%s': %s. Returning NaN.", category, raw_value)
-                        formatted[year][category] = math.nan
+                formatted[year][category] = parse_value(raw_value)
         return formatted
     except Exception as e:
         logger.exception("Error formatting financial data: %s", e)
@@ -79,7 +81,7 @@ def format_financial_data(response_json, categories):
 def merge_analysis_results(results, categories):
     """
     Merge multiple analysis result dictionaries.
-    For each accounting year, use non-NaN values from later results if available.
+    For each year, use non-NaN values from later results if available.
     """
     merged = {}
     for result in results:
@@ -96,7 +98,6 @@ def merge_analysis_results(results, categories):
                         merged[year][category] = new_val
     return merged
 
-# The following helper function attempts to extract a JSON block from a text string.
 def extract_json_from_text(text):
     """
     Attempt to extract a JSON block from the text.
