@@ -2,14 +2,15 @@
 import re
 import json
 import logging
-from typing import List
+from typing import List, Dict
 from PIL import Image, ImageEnhance, ImageFilter
 
 logger = logging.getLogger(__name__)
 
 def preprocess_image(img: Image.Image) -> Image.Image:
     """
-    Convert image to grayscale, boost contrast, and apply a median filter.
+    Convert the image to grayscale, boost contrast, and apply a median filter.
+    This improves OCR accuracy.
     """
     try:
         gray = img.convert('L')
@@ -24,17 +25,19 @@ def preprocess_image(img: Image.Image) -> Image.Image:
 def post_process_text(text: str) -> str:
     """
     Apply post-processing corrections to OCR text.
-    E.g., replace an uppercase 'O' between digits with zero.
+    For example, replace an uppercase 'O' between digits with '0'.
     """
     try:
-        return re.sub(r'(?<=\d)O(?=\d)', '0', text)
+        processed_text = re.sub(r'(?<=\d)O(?=\d)', '0', text)
+        return processed_text
     except Exception as e:
         logger.exception("Error in post_process_text: %s", e)
         raise
 
 def reorder_line(line: str, categories: List[str]) -> str:
     """
-    If a line contains a category keyword, remove it and prepend it.
+    If a line contains one of the expected category keywords, remove it and
+    then prepend it to the line.
     """
     try:
         found = None
@@ -44,7 +47,7 @@ def reorder_line(line: str, categories: List[str]) -> str:
                 line = re.sub(re.escape(cat), '', line, flags=re.IGNORECASE, count=1)
                 break
         if found:
-            line = found + " " + line
+            line = f"{found} {line}"
         return re.sub(r'\s+', ' ', line).strip()
     except Exception as e:
         logger.exception("Error in reorder_line: %s", e)
@@ -52,15 +55,15 @@ def reorder_line(line: str, categories: List[str]) -> str:
 
 def clean_ocr_text(raw_text: str, categories: List[str]) -> str:
     """
-    Clean the OCR text:
-      - Remove URLs.
-      - Keep only lines longer than 10 characters that include a digit or a category keyword.
-      - Reorder lines so that the keyword appears at the beginning.
+    Clean the OCR text by removing URLs and keeping only lines longer than 10 characters
+    that contain digits or one of the specified category keywords.
+    It also standardizes lines by reordering with the category if found.
     """
     try:
         cleaned_lines = []
         for line in raw_text.splitlines():
-            line = re.sub(r"http\S+", "", line)  # Remove URLs
+            # Remove URLs
+            line = re.sub(r"http\S+", "", line)
             if len(line.strip()) > 10 and (re.search(r'\d', line.strip()) or any(cat.lower() in line.lower() for cat in categories)):
                 cleaned_lines.append(reorder_line(line, categories))
         return "\n".join(cleaned_lines)
@@ -70,14 +73,44 @@ def clean_ocr_text(raw_text: str, categories: List[str]) -> str:
 
 def wrap_pages_in_json(pages: List[str]) -> str:
     """
-    Wrap a list of page texts into a structured JSON format with page numbers.
+    Wrap a list of page texts into a JSON structure with page numbers.
     """
     try:
         doc = {"document": {"pages": []}}
         for idx, page_text in enumerate(pages, start=1):
+            # Split the page text into lines and remove empty lines.
             lines = [line.strip() for line in page_text.splitlines() if line.strip()]
             doc["document"]["pages"].append({"page_number": idx, "lines": lines})
         return json.dumps(doc, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.exception("Error in wrap_pages_in_json: %s", e)
         raise
+
+def extract_company_info_from_text(text: str) -> Dict[str, str]:
+    """
+    Extract the company name and CNPJ from the OCR text using regular expressions.
+    
+    This example looks for patterns like "Razão Social:" or "Empresa:" for the company name,
+    and "CNPJ:" followed by a standard formatted CNPJ (e.g., "12.345.678/0001-23").
+    Adjust the regex patterns based on your document layout.
+    
+    Returns:
+        A dictionary with keys 'company_name' and 'cnpj'.
+    """
+    try:
+        company_name = ""
+        cnpj = ""
+        # Try to find the company name using common labels.
+        company_match = re.search(r"(?:Razão Social:|Empresa:)\s*(.+)", text, re.IGNORECASE)
+        if company_match:
+            company_name = company_match.group(1).strip()
+        
+        # Try to find the CNPJ in standard format.
+        cnpj_match = re.search(r"CNPJ:\s*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", text, re.IGNORECASE)
+        if cnpj_match:
+            cnpj = cnpj_match.group(1).strip()
+            
+        return {"company_name": company_name, "cnpj": cnpj}
+    except Exception as e:
+        logger.exception("Error in extract_company_info_from_text: %s", e)
+        return {"company_name": "", "cnpj": ""}

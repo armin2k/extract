@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 # Import our custom modules for processing and database
 from pdf_processor import extract_text
-from ocr_utils import clean_ocr_text, wrap_pages_in_json
+from ocr_utils import clean_ocr_text, wrap_pages_in_json, extract_company_info_from_text
 from api_integration import analyze_with_api, analyze_document_in_batches
 from db import init_db, SessionLocal
 from models import BalanceSheet
@@ -266,15 +266,20 @@ def upload():
             result = analyze_with_api(wrapped_json, provider, CATEGORIES)
             batch_logs = "Single API call used (no batch processing)."
         
-        # 4. Save the analysis result to the database (if available)
+        # 4. Extract company info from the OCR text
+        all_text = "\n".join(cleaned_pages)
+        company_info = extract_company_info_from_text(all_text)
+        company_name = company_info.get("company_name", "")
+        cnpj = company_info.get("cnpj", "")
+
+        # 5. Save the analysis result to the database (if available)
         if result:
             db = SessionLocal()  # Open a database session
             new_sheet = BalanceSheet(
                 filename=filename,
-                data=json.dumps(result)
-                # If you have a way to extract company name and CNPJ, add them here:
-                # company_name="Extracted Company Name",
-                # cnpj="Extracted CNPJ"
+                data=json.dumps(result),
+                company_name=company_name,
+                cnpj=cnpj
             )
             db.add(new_sheet)
             db.commit()
