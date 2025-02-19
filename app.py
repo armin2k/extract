@@ -10,13 +10,13 @@ from flask import Flask, request, render_template_string, send_from_directory, u
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
-# Import custom modules for processing and database
+# Import our custom modules for processing and database
 from pdf_processor import extract_text
 from ocr_utils import clean_ocr_text, wrap_pages_in_json, extract_company_info_from_text
 from api_integration import analyze_with_api, analyze_document_in_batches
 from db import init_db, SessionLocal
 from models import BalanceSheet
-from tasks import process_balance_sheet
+from tasks import process_balance_sheet  # Celery task
 
 # Load environment variables and configure logging
 load_dotenv()
@@ -42,10 +42,7 @@ def load_categories() -> list:
 
 CATEGORIES = load_categories()
 
-# -------------------------------
-# HTML Templates (using Bootstrap)
-# -------------------------------
-
+# HTML Templates
 UPLOAD_HTML = """
 <!doctype html>
 <html lang="en">
@@ -102,48 +99,11 @@ UPLOAD_HTML = """
   function showProgress() {
     document.getElementById("progressDiv").classList.remove("d-none");
   }
-
-  // Polling function to update progress bar (will be called from the processing page)
-  function pollTaskStatus(taskId) {
-    fetch("/task_status/" + taskId)
-      .then(response => response.json())
-      .then(data => {
-        let progressBar = document.getElementById("progressBar");
-        let progressStatus = document.getElementById("progressStatus");
-        let estimatedTime = document.getElementById("estimatedTime");
-        if (data.state === "PROGRESS") {
-          let percent = Math.floor((data.meta.current / data.meta.total) * 100);
-          progressBar.style.width = percent + "%";
-          progressBar.textContent = percent + "%";
-          progressStatus.textContent = data.meta.status;
-          if(data.meta.eta) {
-            estimatedTime.textContent = "Estimated time remaining: " + data.meta.eta + " seconds";
-          }
-          // Continue polling every 2 seconds
-          setTimeout(() => pollTaskStatus(taskId), 2000);
-        } else if (data.state === "SUCCESS") {
-          progressBar.style.width = "100%";
-          progressBar.textContent = "100%";
-          progressStatus.textContent = "Processing complete!";
-          estimatedTime.textContent = "";
-          // Redirect to home or refresh the search page after a short delay
-          setTimeout(() => { window.location.href = "/search"; }, 3000);
-        } else {
-          progressStatus.textContent = "State: " + data.state;
-          setTimeout(() => pollTaskStatus(taskId), 2000);
-        }
-      })
-      .catch(error => {
-        console.error("Error polling task status:", error);
-        setTimeout(() => pollTaskStatus(taskId), 5000);
-      });
-  }
 </script>
 </body>
 </html>
 """
 
-# This page is shown immediately after enqueuing the task.
 PROCESSING_HTML = """
 <!doctype html>
 <html lang="en">
@@ -196,7 +156,6 @@ PROCESSING_HTML = """
             progressBar.textContent = "100%";
             progressStatus.textContent = "Processing complete!";
             estimatedTime.textContent = "";
-            // Redirect to view the record details
             window.location.href = "/view/" + data.meta.record_id;
           } else {
             progressStatus.textContent = "State: " + data.state;
@@ -208,9 +167,52 @@ PROCESSING_HTML = """
           setTimeout(() => pollTaskStatus(taskId), 5000);
         });
     }
-    // Start polling immediately
     pollTaskStatus("{{ task_id }}");
   </script>
+</div>
+<!-- Bootstrap JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+"""
+
+SEARCH_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Search Balance Sheets</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Bootstrap CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+<div class="container">
+  <nav class="navbar navbar-expand-lg navbar-light bg-light">
+    <div class="container-fluid">
+      <a class="navbar-brand" href="/">Balance Sheet Analyzer</a>
+      <div class="collapse navbar-collapse">
+        <ul class="navbar-nav me-auto">
+          <li class="nav-item"><a class="nav-link" href="/">Upload</a></li>
+          <li class="nav-item"><a class="nav-link" href="/search">Search</a></li>
+        </ul>
+      </div>
+    </div>
+  </nav>
+  <h2 class="mt-4">Search Balance Sheets</h2>
+  <form method="POST" action="/search">
+    <div class="mb-3">
+      <label for="company_name" class="form-label">Company Name:</label>
+      <input type="text" name="company_name" id="company_name" class="form-control" placeholder="Enter company name">
+    </div>
+    <div class="mb-3">
+      <label for="cnpj" class="form-label">CNPJ:</label>
+      <input type="text" name="cnpj" id="cnpj" class="form-control" placeholder="Enter CNPJ">
+    </div>
+    <button type="submit" class="btn btn-primary">Search</button>
+  </form>
+  <br>
+  <a href="/" class="btn btn-secondary">Back to Home</a>
 </div>
 <!-- Bootstrap JS -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
@@ -369,7 +371,6 @@ def upload():
 
         # Enqueue the processing task via Celery
         task = process_balance_sheet.delay(filename, upload_path, provider, CATEGORIES)
-        # Redirect to a processing page with task ID (the page will poll for status)
         return render_template_string(PROCESSING_HTML, task_id=task.id)
     except Exception as e:
         logger.exception("Error processing uploaded file:")
@@ -396,15 +397,21 @@ def search():
     if request.method == "POST":
         company_name = request.form.get("company_name", "").strip()
         cnpj = request.form.get("cnpj", "").strip()
-        db = SessionLocal()
-        query = db.query(BalanceSheet)
-        if company_name:
-            query = query.filter(BalanceSheet.company_name.ilike(f"%{company_name}%"))
-        if cnpj:
-            query = query.filter(BalanceSheet.cnpj.ilike(f"%{cnpj}%"))
-        results = query.all()
-        db.close()
-        return render_template_string(RESULTS_HTML, results=results, company_name=company_name, cnpj=cnpj)
+        logger.info("Search requested with company_name: '%s' and cnpj: '%s'", company_name, cnpj)
+        try:
+            db = SessionLocal()
+            query = db.query(BalanceSheet)
+            if company_name:
+                query = query.filter(BalanceSheet.company_name.ilike(f"%{company_name}%"))
+            if cnpj:
+                query = query.filter(BalanceSheet.cnpj.ilike(f"%{cnpj}%"))
+            results = query.all()
+            db.close()
+            logger.info("Found %d results", len(results))
+            return render_template_string(RESULTS_HTML, results=results, company_name=company_name, cnpj=cnpj)
+        except Exception as e:
+            logger.exception("Error during search query: %s", e)
+            return f"Internal Server Error: {str(e)}", 500
     else:
         return render_template_string(SEARCH_HTML)
 
@@ -421,7 +428,7 @@ def view_sheet(sheet_id: int):
         except Exception as e:
             logger.exception("Error parsing sheet data: %s", e)
             data = {}
-        # Calculate processing time if available in the data meta (assuming your task stored it)
+        # Optionally, if your Celery task returns processing time in its meta, you can include it.
         processing_time = data.get("processing_time", "N/A")
         return render_template_string(VIEW_HTML, sheet=sheet, data=data, processing_time=processing_time)
     else:
@@ -429,4 +436,5 @@ def view_sheet(sheet_id: int):
 
 if __name__ == "__main__":
     init_db()  # Initialize the database and create tables if they don't exist
+    app.debug = True  # Enable debug mode for development (disable in production)
     app.run(host="0.0.0.0", port=8000)
