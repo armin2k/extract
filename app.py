@@ -9,18 +9,19 @@ import pandas as pd
 from flask import Flask, request, render_template_string, send_from_directory, url_for, redirect, jsonify
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-load_dotenv()
 
-# Import our custom modules for processing and database
+# Import our custom modules for processing, API integration, and database
 from pdf_processor import extract_text
 from ocr_utils import clean_ocr_text, wrap_pages_in_json, extract_company_info_from_text
 from api_integration import analyze_with_api, analyze_document_in_batches
 from db import init_db, SessionLocal
 from models import BalanceSheet
-from tasks import process_balance_sheet  # Celery task
+from tasks import process_balance_sheet
 
-# Load environment variables and configure logging
+# Load environment variables
 load_dotenv()
+
+# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,6 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs("output", exist_ok=True)
 
 CATEGORIES_FILE = "categories.json"
-
 def load_categories() -> list:
     """Load balance sheet categories from a JSON file."""
     try:
@@ -40,10 +40,12 @@ def load_categories() -> list:
     except Exception as e:
         logger.exception("Failed to load categories: %s", e)
         return []
-
 CATEGORIES = load_categories()
 
-# HTML Templates
+# --------------------------
+# HTML Templates using Bootstrap
+# --------------------------
+
 UPLOAD_HTML = """
 <!doctype html>
 <html lang="en">
@@ -311,6 +313,7 @@ VIEW_HTML = """
   <h2 class="mt-4">Balance Sheet Detail for {{ sheet.company_name }} ({{ sheet.cnpj }})</h2>
   <p><strong>Filename:</strong> {{ sheet.filename }}</p>
   <p><strong>Created At:</strong> {{ sheet.created_at }}</p>
+  <p><strong>Processing Time:</strong> {{ processing_time }}</p>
   <h3>Extracted Data</h3>
   {% if data %}
     {% for year, details in data.items() %}
@@ -335,6 +338,14 @@ VIEW_HTML = """
   {% else %}
     <p>No extracted data available.</p>
   {% endif %}
+  
+  <h3>Download Files</h3>
+  <ul>
+    <li><a href="{{ url_for('download_file', filename=sheet.filename + '_ocr.json') }}">Download OCR JSON File</a></li>
+    <li><a href="{{ url_for('download_file', filename=sheet.filename + '_analysis.json') }}">Download Analysis JSON File</a></li>
+    <li><a href="{{ url_for('download_file', filename=sheet.filename + '_analysis.xlsx') }}">Download Analysis XLS File</a></li>
+  </ul>
+  
   <a href="/search" class="btn btn-secondary">Back to Search</a>
   <a href="/" class="btn btn-primary">Back to Home</a>
 </div>
@@ -344,9 +355,9 @@ VIEW_HTML = """
 </html>
 """
 
-# ------------------------------
+# --------------------------
 # Routes
-# ------------------------------
+# --------------------------
 
 @app.route("/", methods=["GET"])
 def index():
@@ -355,7 +366,6 @@ def index():
 @app.route("/upload", methods=["POST"])
 def upload():
     try:
-        # 1. Validate and save the uploaded file
         if "file" not in request.files:
             return "No file part", 400
         file = request.files["file"]
@@ -370,7 +380,7 @@ def upload():
         file.save(upload_path)
         logger.info(f"File {filename} saved to {upload_path}.")
 
-        # Enqueue the processing task via Celery
+        # Enqueue the processing task via Celery.
         task = process_balance_sheet.delay(filename, upload_path, provider, CATEGORIES)
         return render_template_string(PROCESSING_HTML, task_id=task.id)
     except Exception as e:
@@ -381,10 +391,7 @@ def upload():
 def task_status(task_id):
     from celery.result import AsyncResult
     res = AsyncResult(task_id)
-    response = {
-        "state": res.state,
-        "meta": res.info if res.info else {}
-    }
+    response = {"state": res.state, "meta": res.info if res.info else {}}
     return jsonify(response)
 
 @app.route("/download/<path:filename>")
@@ -412,7 +419,7 @@ def search():
             return render_template_string(RESULTS_HTML, results=results, company_name=company_name, cnpj=cnpj)
         except Exception as e:
             logger.exception("Error during search query: %s", e)
-            return f"Internal Server Error: {str(e)}", 500
+            return "Internal Server Error", 500
     else:
         return render_template_string(SEARCH_HTML)
 
@@ -429,13 +436,12 @@ def view_sheet(sheet_id: int):
         except Exception as e:
             logger.exception("Error parsing sheet data: %s", e)
             data = {}
-        # Optionally, if your Celery task returns processing time in its meta, you can include it.
         processing_time = data.get("processing_time", "N/A")
         return render_template_string(VIEW_HTML, sheet=sheet, data=data, processing_time=processing_time)
     else:
         return "Record not found", 404
 
 if __name__ == "__main__":
-    init_db()  # Initialize the database and create tables if they don't exist
+    init_db()  # Initialize database (create tables, etc.)
     app.debug = True  # Enable debug mode for development (disable in production)
     app.run(host="0.0.0.0", port=8000)

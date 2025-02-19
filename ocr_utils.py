@@ -138,3 +138,34 @@ def extract_company_info_from_text(text: str) -> Dict[str, str]:
     except Exception as e:
         logger.exception("Error in extract_company_info_from_text: %s", e)
         return {"company_name": "", "cnpj": ""}
+
+def extract_json_from_text(text: str) -> str:
+    """
+    Attempt to extract a JSON block from the text.
+    This function looks for content enclosed in triple backticks (optionally with 'json')
+    and, if not found, tries to extract from the first "{" to the last "}".
+    Returns the extracted JSON string if successful, or None if no valid JSON is found.
+    """
+    import re
+    import json
+
+    # Look for triple backticks encapsulating JSON
+    candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    for candidate in candidates:
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            continue
+
+    # Fallback: Extract from first '{' to last '}'
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1:
+        candidate = text[start:end+1]
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            return None
+    return None
