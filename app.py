@@ -10,7 +10,7 @@ from flask import Flask, request, render_template_string, send_from_directory, u
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
-# Import our custom modules for processing, API integration, and database
+# Import custom modules for processing, API integration, and database
 from pdf_processor import extract_text
 from ocr_utils import clean_ocr_text, wrap_pages_in_json, extract_company_info_from_text
 from api_integration import analyze_with_api, analyze_document_in_batches
@@ -18,7 +18,7 @@ from db import init_db, SessionLocal
 from models import BalanceSheet
 from tasks import process_balance_sheet
 
-# Load environment variables
+# Load environment variables from .env
 load_dotenv()
 
 # Configure logging
@@ -43,7 +43,7 @@ def load_categories() -> list:
 CATEGORIES = load_categories()
 
 # --------------------------
-# HTML Templates (using Bootstrap)
+# HTML Templates using Bootstrap
 # --------------------------
 
 UPLOAD_HTML = """
@@ -53,6 +53,7 @@ UPLOAD_HTML = """
   <meta charset="utf-8">
   <title>Balance Sheet Analyzer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Bootstrap CSS -->
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <style> body { padding-top: 60px; } </style>
 </head>
@@ -303,6 +304,7 @@ VIEW_HTML = """
   <p><strong>Filename:</strong> {{ sheet.filename }}</p>
   <p><strong>Created At:</strong> {{ sheet.created_at }}</p>
   <p><strong>Processing Time:</strong> {{ processing_time }}</p>
+  
   <h3>Extracted Data</h3>
   {% if data %}
     {% for year, details in data.items() %}
@@ -368,6 +370,7 @@ def upload():
         file.save(upload_path)
         logger.info(f"File {filename} saved to {upload_path}.")
 
+        # Enqueue the processing task via Celery.
         task = process_balance_sheet.delay(filename, upload_path, provider, CATEGORIES)
         return render_template_string(PROCESSING_HTML, task_id=task.id)
     except Exception as e:
