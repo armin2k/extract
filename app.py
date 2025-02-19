@@ -9,6 +9,7 @@ import pandas as pd
 from flask import Flask, request, render_template_string, send_from_directory, url_for, redirect, jsonify
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
+load_dotenv()
 
 # Import our custom modules for processing and database
 from pdf_processor import extract_text
