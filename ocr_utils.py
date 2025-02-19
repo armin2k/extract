@@ -15,7 +15,7 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     try:
         gray = img.convert('L')
         enhancer = ImageEnhance.Contrast(gray)
-        gray = enhancer.enhance(2)  # Adjust factor as needed
+        gray = enhancer.enhance(2)  # Adjust the factor as needed
         gray = gray.filter(ImageFilter.MedianFilter())
         return gray
     except Exception as e:
@@ -77,6 +77,7 @@ def wrap_pages_in_json(pages: List[str]) -> str:
     try:
         doc = {"document": {"pages": []}}
         for idx, page_text in enumerate(pages, start=1):
+            # Split the page text into lines and remove empty lines.
             lines = [line.strip() for line in page_text.splitlines() if line.strip()]
             doc["document"]["pages"].append({"page_number": idx, "lines": lines})
         return json.dumps(doc, ensure_ascii=False, indent=2)
@@ -86,37 +87,33 @@ def wrap_pages_in_json(pages: List[str]) -> str:
 
 def extract_company_info_from_text(text: str) -> Dict[str, str]:
     """
-    Improved extraction of company name and CNPJ from the OCR text.
+    Improved extraction of company name and CNPJ from OCR text.
     
-    This function looks for common labels (like "Empresa:" or "Razão Social:" for the company name)
-    and "CNPJ:" for the CNPJ. It uses flexible regex patterns that allow for variations.
+    For the company name, this function takes the first non-empty line,
+    removes any leading numbers and spaces, and treats the remainder as the company name.
+    
+    For the CNPJ, it uses a regex to capture a standard formatted CNPJ.
     
     Returns:
         A dictionary with keys 'company_name' and 'cnpj'.
     """
     try:
-        # Initialize with empty strings
         company_name = ""
         cnpj = ""
         
-        # Patterns for company name: look for "Empresa:" or "Razão Social:" followed by text.
-        # Allow letters, numbers, spaces, and some punctuation (e.g., &, ., -, etc.).
-        company_pattern = r"(?:Empresa|Razão Social)[:\s]+([\w\sÀ-ÿ.,&-]+)"
-        company_match = re.search(company_pattern, text, re.IGNORECASE)
-        if company_match:
-            company_name = company_match.group(1).strip()
+        # Split the text into lines and take the first non-empty line as a candidate for the company name.
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if lines:
+            # Assume the first line is something like "3013 ALNITAK COMERCIO DE ARTIGOS PARA CASA LTDA"
+            first_line = lines[0]
+            # Remove any leading digits and spaces (e.g., "3013 ")
+            company_name = re.sub(r"^\d+\s*", "", first_line).strip()
         
-        # Pattern for CNPJ: looking for standard formats.
-        # This pattern accepts numbers with or without punctuation.
-        cnpj_pattern = r"CNPJ[:\s]+((?:\d{2}[.\-\/\s]*){3}\d{4}[-\s]*\d{2})"
+        # Use regex to extract the CNPJ. This pattern expects the label "CNPJ:" followed by a CNPJ.
+        cnpj_pattern = r"CNPJ:\s*([\d]{2}\.[\d]{3}\.[\d]{3}/[\d]{4}-[\d]{2})"
         cnpj_match = re.search(cnpj_pattern, text, re.IGNORECASE)
         if cnpj_match:
-            # Remove any extra spaces or punctuation if needed.
-            raw_cnpj = cnpj_match.group(1)
-            cnpj = re.sub(r"[^\d]", "", raw_cnpj)  # keep only digits
-            # Optionally, you can reformat it:
-            if len(cnpj) == 14:
-                cnpj = f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+            cnpj = cnpj_match.group(1).strip()
         
         return {"company_name": company_name, "cnpj": cnpj}
     except Exception as e:
