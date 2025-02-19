@@ -3,30 +3,25 @@ import os
 import json
 import logging
 import requests
-from typing import Tuple, Dict, Any
-import concurrent.futures
 from tenacity import retry, wait_exponential, stop_after_attempt
 from data_parser import format_financial_data, merge_analysis_results
-from ocr_utils import wrap_pages_in_json
 
 logger = logging.getLogger(__name__)
 
-# Create a persistent session for API calls
+# Create a persistent session for all API calls.
 session = requests.Session()
 
-def get_api_parameters(provider: str) -> Tuple[str, Dict[str, str], str, int]:
+def get_api_parameters(provider: str):
     """
-    Return API parameters (URL, headers, model, timeout) based on the provider.
+    Return the API endpoint URL, headers, model, and timeout value based on the provider.
     """
     if provider == "deepseek":
         url = "http://localhost:11434/v1/chat/completions"
         headers = {}
         model = "deepseek-r1:14b"
         timeout_value = 240
-    else:
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key:
-            logger.error("OPENAI_API_KEY is not set.")
+    else:  # Default to ChatGPT API
+        api_key = os.getenv("OPENAI_API_KEY")
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}"}
         model = "gpt-4o-mini"
@@ -34,24 +29,24 @@ def get_api_parameters(provider: str) -> Tuple[str, Dict[str, str], str, int]:
     return url, headers, model, timeout_value
 
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
-def make_api_call(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout_value: int) -> Dict[str, Any]:
+def make_api_call(url: str, headers: dict, payload: dict, timeout_value: int):
     """
-    Make an API call with exponential backoff.
+    Make an API call with retries using exponential backoff.
     """
     response = session.post(url, headers=headers, json=payload, timeout=timeout_value)
     if response.status_code != 200:
         raise Exception(f"API call failed with status {response.status_code}: {response.text}")
     return response.json()
 
-def analyze_with_api(text_json: str, provider: str, categories: list) -> Dict[str, Any]:
+def analyze_with_api(text_json: str, provider: str, categories: list):
     """
     Analyze the provided OCR JSON using the chosen API.
+    Constructs a prompt using the categories and text_json,
+    makes the API call, and formats the response.
     """
     prompt = f"""
-Você é um especialista em contabilidade brasileira. A seguir, é fornecido um balanço patrimonial extraído por OCR, com a formatação preservada num objeto JSON.
-Extraia somente os dados financeiros relevantes, convertendo "1.234,56" para 1234.56 e "(1.234,56)" para -1234.56; use NaN para valores ausentes.
-Se houver dados de múltiplos anos, utilize os anos (4 dígitos) como chaves; caso contrário, utilize "Ano Desconhecido".
-Retorne APENAS um objeto JSON com os valores extraídos.
+Você é um especialista em contabilidade brasileira. Extraia os dados financeiros relevantes a partir do seguinte documento JSON.
+Retorne apenas um objeto JSON com os valores extraídos.
 
 Categorias:
 {json.dumps(categories, indent=4, ensure_ascii=False)}
@@ -69,50 +64,59 @@ Documento (em JSON):
         response_json = make_api_call(url, headers, payload, timeout_value)
         return format_financial_data(response_json, categories)
     except Exception as e:
-        logger.exception("API Error: %s", e)
+        logger.exception("Error during API call: %s", e)
         return {}
 
-def analyze_document_in_batches(text_json: str, provider: str, categories: list, batch_size: int = 10000, overlap: int = 500) -> Tuple[Dict[str, Any], str]:
+def analyze_document_in_batches(text_json: str, provider: str, categories: list, batch_size: int = 10000, overlap: int = 500):
     """
-    Split the OCR JSON text into overlapping batches and analyze them concurrently.
-    Returns a tuple (merged_result, logs).
+    Splits the provided JSON text into overlapping batches and processes them concurrently via API calls.
+    Merges the results and returns the final JSON along with processing logs.
     """
     logs = []
     try:
         doc_data = json.loads(text_json)
+        # If the JSON has a 'document' with 'pages', combine all lines from all pages.
         if isinstance(doc_data.get("document"), dict) and "pages" in doc_data["document"]:
-            # Combine pages into one long text for batching.
             doc = "\n".join(["\n".join(page.get("lines", [])) for page in doc_data["document"]["pages"]])
         else:
             doc = doc_data.get("document", "")
     except Exception as e:
-        logs.append(f"Error loading wrapped JSON: {e}")
+        logs.append(f"Error parsing JSON: {e}")
         return {}, "\n".join(logs)
     
+    # Create batches with the specified overlap.
     batches = []
     start = 0
     while start < len(doc):
         end = start + batch_size
         batches.append(doc[start:end])
         start = end - overlap
+    
     logs.append(f"Created {len(batches)} batches (batch_size={batch_size}, overlap={overlap}).")
     
+    # Process batches concurrently using a ThreadPoolExecutor.
+    import concurrent.futures
     results = []
     max_workers = min(32, (os.cpu_count() or 1) * 2)
-    logs.append(f"Processing {len(batches)} batches concurrently (max_workers={max_workers}).")
+    logs.append(f"Processing {len(batches)} batches concurrently with {max_workers} workers.")
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(analyze_with_api, wrap_pages_in_json([batch]), provider, categories): i+1 for i, batch in enumerate(batches)}
-        for future in concurrent.futures.as_completed(futures):
-            idx = futures[future]
+        future_to_batch = {
+            executor.submit(analyze_with_api, wrap_pages_in_json([batch]), provider, categories): idx
+            for idx, batch in enumerate(batches)
+        }
+        for future in concurrent.futures.as_completed(future_to_batch):
+            idx = future_to_batch[future]
             try:
-                result = future.result()
-                if result:
-                    results.append(result)
+                batch_result = future.result()
+                if batch_result:
+                    results.append(batch_result)
                     logs.append(f"Batch {idx} processed successfully.")
                 else:
-                    logs.append(f"Warning: No result from batch {idx}.")
+                    logs.append(f"Batch {idx} returned no result.")
             except Exception as e:
-                logs.append(f"Batch {idx} generated an exception: {e}")
+                logs.append(f"Batch {idx} raised an exception: {e}")
+    
     if results:
         merged_result = merge_analysis_results(results, categories)
         logs.append("Merged results from batches successfully.")

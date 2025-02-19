@@ -4,17 +4,19 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 import math
 import json
 import logging
+import time
 import pandas as pd
-from flask import Flask, request, render_template_string, send_from_directory, url_for
+from flask import Flask, request, render_template_string, send_from_directory, url_for, redirect, jsonify
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
-# Import our custom modules for processing and database
+# Import custom modules for processing and database
 from pdf_processor import extract_text
 from ocr_utils import clean_ocr_text, wrap_pages_in_json, extract_company_info_from_text
 from api_integration import analyze_with_api, analyze_document_in_batches
 from db import init_db, SessionLocal
 from models import BalanceSheet
+from tasks import process_balance_sheet
 
 # Load environment variables and configure logging
 load_dotenv()
@@ -40,7 +42,9 @@ def load_categories() -> list:
 
 CATEGORIES = load_categories()
 
-# HTML templates
+# -------------------------------
+# HTML Templates (using Bootstrap)
+# -------------------------------
 
 UPLOAD_HTML = """
 <!doctype html>
@@ -48,123 +52,168 @@ UPLOAD_HTML = """
 <head>
   <meta charset="utf-8">
   <title>Balance Sheet Analyzer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Bootstrap CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
-    body { font-family: Arial, sans-serif; background-color: #f2f2f2; margin: 0; padding: 0; }
-    .container { width: 80%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-    h2 { color: #333; }
-    form { margin-top: 20px; }
-    label { display: block; margin-bottom: 5px; }
-    input[type="file"], select { padding: 10px; width: 100%; margin-bottom: 15px; }
-    input[type="submit"] { padding: 10px 20px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
-    input[type="submit"]:hover { background: #45a049; }
-    .menu a { margin-right: 15px; }
-    .progress { display: none; margin-top: 20px; text-align: center; }
-    .progress p { font-size: 16px; color: #555; }
-    .progress progress { width: 100%; height: 20px; }
+    body { padding-top: 60px; }
   </style>
-  <script>
-    function showProgress() {
-      document.getElementById("progressDiv").style.display = "block";
-    }
-  </script>
 </head>
 <body>
-<div class="container">
-  <div class="menu">
-    <a href="/">Home</a> |
-    <a href="/search">Search Balance Sheets</a>
+<nav class="navbar navbar-expand-lg navbar-light bg-light fixed-top">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="/">Balance Sheet Analyzer</a>
+    <div class="collapse navbar-collapse">
+      <ul class="navbar-nav me-auto">
+        <li class="nav-item"><a class="nav-link" href="/">Upload</a></li>
+        <li class="nav-item"><a class="nav-link" href="/search">Search</a></li>
+      </ul>
+    </div>
   </div>
+</nav>
+<div class="container">
   <h2>Upload Balance Sheet</h2>
-  <form method="post" enctype="multipart/form-data" action="/upload" onsubmit="showProgress()">
-    <label for="file">Select a Balance Sheet PDF:</label>
-    <input type="file" name="file" id="file">
-    <label for="provider">Select API Provider:</label>
-    <select name="provider" id="provider">
-      <option value="chatgpt">ChatGPT API (gpt-4o-mini)</option>
-      <option value="deepseek">DeepSeek API (via Ollama offline)</option>
-    </select>
-    <input type="submit" value="Upload">
+  <form method="post" enctype="multipart/form-data" action="/upload" onsubmit="showProgress();">
+    <div class="mb-3">
+      <label for="file" class="form-label">Select a Balance Sheet PDF:</label>
+      <input type="file" class="form-control" name="file" id="file" required>
+    </div>
+    <div class="mb-3">
+      <label for="provider" class="form-label">Select API Provider:</label>
+      <select class="form-select" name="provider" id="provider">
+        <option value="chatgpt">ChatGPT API (gpt-4o-mini)</option>
+        <option value="deepseek">DeepSeek API (via Ollama offline)</option>
+      </select>
+    </div>
+    <button type="submit" class="btn btn-primary">Upload</button>
   </form>
-  <div class="progress" id="progressDiv">
-    <p>Processing... please wait.</p>
-    <progress value="0" max="100" id="progressBar"></progress>
+  <br>
+  <div id="progressDiv" class="d-none">
+    <div class="progress">
+      <div id="progressBar" class="progress-bar" role="progressbar" style="width: 0%;">0%</div>
+    </div>
+    <p id="progressStatus" class="mt-2"></p>
+    <p id="estimatedTime" class="mt-2"></p>
   </div>
 </div>
+<!-- Bootstrap JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+  function showProgress() {
+    document.getElementById("progressDiv").classList.remove("d-none");
+  }
+
+  // Polling function to update progress bar (will be called from the processing page)
+  function pollTaskStatus(taskId) {
+    fetch("/task_status/" + taskId)
+      .then(response => response.json())
+      .then(data => {
+        let progressBar = document.getElementById("progressBar");
+        let progressStatus = document.getElementById("progressStatus");
+        let estimatedTime = document.getElementById("estimatedTime");
+        if (data.state === "PROGRESS") {
+          let percent = Math.floor((data.meta.current / data.meta.total) * 100);
+          progressBar.style.width = percent + "%";
+          progressBar.textContent = percent + "%";
+          progressStatus.textContent = data.meta.status;
+          if(data.meta.eta) {
+            estimatedTime.textContent = "Estimated time remaining: " + data.meta.eta + " seconds";
+          }
+          // Continue polling every 2 seconds
+          setTimeout(() => pollTaskStatus(taskId), 2000);
+        } else if (data.state === "SUCCESS") {
+          progressBar.style.width = "100%";
+          progressBar.textContent = "100%";
+          progressStatus.textContent = "Processing complete!";
+          estimatedTime.textContent = "";
+          // Redirect to home or refresh the search page after a short delay
+          setTimeout(() => { window.location.href = "/search"; }, 3000);
+        } else {
+          progressStatus.textContent = "State: " + data.state;
+          setTimeout(() => pollTaskStatus(taskId), 2000);
+        }
+      })
+      .catch(error => {
+        console.error("Error polling task status:", error);
+        setTimeout(() => pollTaskStatus(taskId), 5000);
+      });
+  }
+</script>
 </body>
 </html>
 """
 
-RESULT_HTML = """
+# This page is shown immediately after enqueuing the task.
+PROCESSING_HTML = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Analysis Result</title>
-  <style>
-    body { font-family: Arial, sans-serif; background-color: #f2f2f2; margin: 0; padding: 0; }
-    .container { width: 80%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); text-align: center; }
-    a { display: block; margin: 15px 0; font-size: 18px; color: #4CAF50; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    pre { background: #f9f9f9; border: 1px solid #ddd; padding: 10px; text-align: left; overflow-x: auto; font-size: 14px; }
-  </style>
+  <title>Processing Balance Sheet</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Bootstrap CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body>
-<div class="container">
-  <div class="menu">
-    <a href="/">Home</a> |
-    <a href="/search">Search Balance Sheets</a>
+<nav class="navbar navbar-expand-lg navbar-light bg-light fixed-top">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="/">Balance Sheet Analyzer</a>
+    <div class="collapse navbar-collapse">
+      <ul class="navbar-nav me-auto">
+        <li class="nav-item"><a class="nav-link" href="/">Upload</a></li>
+        <li class="nav-item"><a class="nav-link" href="/search">Search</a></li>
+      </ul>
+    </div>
   </div>
-  <h2>Analysis Result for {{ filename }}</h2>
-  {% if download_analysis_link %}
-    <a href="{{ download_analysis_link }}">Download Analysis JSON File</a>
-  {% else %}
-    <p>No analysis result available.</p>
-  {% endif %}
-  <a href="{{ download_ocr_link }}">Download OCR JSON File</a>
-  {% if download_xls_link %}
-    <a href="{{ download_xls_link }}">Download Analysis XLS File</a>
-  {% endif %}
-  <h3>Batch Processing Logs</h3>
-  <pre>{{ batch_logs }}</pre>
-  <br>
-  <a href="/">Upload another file</a>
-</div>
-</body>
-</html>
-"""
-
-SEARCH_HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Search Balance Sheets</title>
-  <style>
-    body { font-family: Arial, sans-serif; background-color: #f2f2f2; margin: 0; padding: 0; }
-    .container { width: 80%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-    input[type="text"] { width: 100%; padding: 10px; margin: 10px 0; }
-    input[type="submit"] { padding: 10px 20px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; }
-    input[type="submit"]:hover { background: #45a049; }
-    .menu a { margin-right: 15px; }
-  </style>
-</head>
-<body>
-<div class="container">
-  <div class="menu">
-    <a href="/">Home</a> |
-    <a href="/search">Search Balance Sheets</a>
+</nav>
+<div class="container" style="padding-top: 80px;">
+  <h2>Your balance sheet is being processed</h2>
+  <p>Task ID: {{ task_id }}</p>
+  <div class="progress">
+    <div id="progressBar" class="progress-bar" role="progressbar" style="width: 0%;">0%</div>
   </div>
-  <h2>Search Balance Sheets</h2>
-  <form method="POST" action="/search">
-    <label for="company_name">Company Name:</label>
-    <input type="text" name="company_name" id="company_name" placeholder="Enter company name">
-    <label for="cnpj">CNPJ:</label>
-    <input type="text" name="cnpj" id="cnpj" placeholder="Enter CNPJ">
-    <input type="submit" value="Search">
-  </form>
-  <br>
-  <a href="/">Back to Home</a>
+  <p id="progressStatus" class="mt-2"></p>
+  <p id="estimatedTime" class="mt-2"></p>
+  <script>
+    function pollTaskStatus(taskId) {
+      fetch("/task_status/" + taskId)
+        .then(response => response.json())
+        .then(data => {
+          let progressBar = document.getElementById("progressBar");
+          let progressStatus = document.getElementById("progressStatus");
+          let estimatedTime = document.getElementById("estimatedTime");
+          if (data.state === "PROGRESS") {
+            let percent = Math.floor((data.meta.current / data.meta.total) * 100);
+            progressBar.style.width = percent + "%";
+            progressBar.textContent = percent + "%";
+            progressStatus.textContent = data.meta.status;
+            if(data.meta.eta) {
+              estimatedTime.textContent = "Estimated time remaining: " + data.meta.eta + " seconds";
+            }
+            setTimeout(() => pollTaskStatus(taskId), 2000);
+          } else if (data.state === "SUCCESS") {
+            progressBar.style.width = "100%";
+            progressBar.textContent = "100%";
+            progressStatus.textContent = "Processing complete!";
+            estimatedTime.textContent = "";
+            // Redirect to view the record details
+            window.location.href = "/view/" + data.meta.record_id;
+          } else {
+            progressStatus.textContent = "State: " + data.state;
+            setTimeout(() => pollTaskStatus(taskId), 2000);
+          }
+        })
+        .catch(error => {
+          console.error("Error polling task status:", error);
+          setTimeout(() => pollTaskStatus(taskId), 5000);
+        });
+    }
+    // Start polling immediately
+    pollTaskStatus("{{ task_id }}");
+  </script>
 </div>
+<!-- Bootstrap JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
 """
@@ -175,24 +224,29 @@ RESULTS_HTML = """
 <head>
   <meta charset="utf-8">
   <title>Search Results</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Bootstrap CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
-    body { font-family: Arial, sans-serif; background-color: #f2f2f2; margin: 0; padding: 0; }
-    .container { width: 80%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-    th { background-color: #4CAF50; color: white; }
-    .menu a { margin-right: 15px; }
+    .action-link { color: blue; text-decoration: underline; cursor: pointer; }
   </style>
 </head>
 <body>
 <div class="container">
-  <div class="menu">
-    <a href="/">Home</a> |
-    <a href="/search">Search Balance Sheets</a>
-  </div>
-  <h2>Search Results for "{{ company_name }}" and "{{ cnpj }}"</h2>
+  <nav class="navbar navbar-expand-lg navbar-light bg-light">
+    <div class="container-fluid">
+      <a class="navbar-brand" href="/">Balance Sheet Analyzer</a>
+      <div class="collapse navbar-collapse">
+        <ul class="navbar-nav me-auto">
+          <li class="nav-item"><a class="nav-link" href="/">Upload</a></li>
+          <li class="nav-item"><a class="nav-link" href="/search">Search</a></li>
+        </ul>
+      </div>
+    </div>
+  </nav>
+  <h2 class="mt-4">Search Results for "{{ company_name }}" and "{{ cnpj }}"</h2>
   {% if results %}
-    <table>
+    <table class="table table-striped">
       <thead>
         <tr>
           <th>ID</th>
@@ -200,6 +254,7 @@ RESULTS_HTML = """
           <th>Company Name</th>
           <th>CNPJ</th>
           <th>Created At</th>
+          <th>Action</th>
         </tr>
       </thead>
       <tbody>
@@ -210,6 +265,7 @@ RESULTS_HTML = """
           <td>{{ sheet.company_name }}</td>
           <td>{{ sheet.cnpj }}</td>
           <td>{{ sheet.created_at }}</td>
+          <td><a class="action-link" href="{{ url_for('view_sheet', sheet_id=sheet.id) }}">View Details</a></td>
         </tr>
         {% endfor %}
       </tbody>
@@ -217,14 +273,77 @@ RESULTS_HTML = """
   {% else %}
     <p>No results found.</p>
   {% endif %}
-  <br>
-  <a href="/search">Back to Search</a>
-  <br>
-  <a href="/">Back to Home</a>
+  <a href="/search" class="btn btn-secondary">Back to Search</a>
+  <a href="/" class="btn btn-primary">Back to Home</a>
 </div>
+<!-- Bootstrap JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
 """
+
+VIEW_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Balance Sheet Detail</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Bootstrap CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+<div class="container mt-4">
+  <nav class="navbar navbar-expand-lg navbar-light bg-light">
+    <div class="container-fluid">
+      <a class="navbar-brand" href="/">Balance Sheet Analyzer</a>
+      <div class="collapse navbar-collapse">
+        <ul class="navbar-nav me-auto">
+          <li class="nav-item"><a class="nav-link" href="/">Upload</a></li>
+          <li class="nav-item"><a class="nav-link" href="/search">Search</a></li>
+        </ul>
+      </div>
+    </div>
+  </nav>
+  <h2 class="mt-4">Balance Sheet Detail for {{ sheet.company_name }} ({{ sheet.cnpj }})</h2>
+  <p><strong>Filename:</strong> {{ sheet.filename }}</p>
+  <p><strong>Created At:</strong> {{ sheet.created_at }}</p>
+  <h3>Extracted Data</h3>
+  {% if data %}
+    {% for year, details in data.items() %}
+      <h4>{{ year }}</h4>
+      <table class="table table-bordered">
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for category, value in details.items() %}
+            <tr>
+              <td>{{ category }}</td>
+              <td>{{ value }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endfor %}
+  {% else %}
+    <p>No extracted data available.</p>
+  {% endif %}
+  <a href="/search" class="btn btn-secondary">Back to Search</a>
+  <a href="/" class="btn btn-primary">Back to Home</a>
+</div>
+<!-- Bootstrap JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+"""
+
+# ------------------------------
+# Routes
+# ------------------------------
 
 @app.route("/", methods=["GET"])
 def index():
@@ -248,69 +367,23 @@ def upload():
         file.save(upload_path)
         logger.info(f"File {filename} saved to {upload_path}.")
 
-        # 2. Process the PDF: extract pages, clean them, and wrap into JSON
-        raw_pages = extract_text(upload_path)
-        cleaned_pages = [clean_ocr_text(page, CATEGORIES) for page in raw_pages]
-        wrapped_json = wrap_pages_in_json(cleaned_pages)
-        
-        # Save OCR JSON output for download
-        json_text_path = os.path.join("output", f"{filename}_ocr.json")
-        with open(json_text_path, "w", encoding="utf-8") as f:
-            f.write(wrapped_json)
-        
-        # 3. Analyze the document using the API
-        total_text_length = sum(len(page) for page in cleaned_pages)
-        if total_text_length > 10000:
-            result, batch_logs = analyze_document_in_batches(wrapped_json, provider, CATEGORIES, batch_size=10000, overlap=500)
-        else:
-            result = analyze_with_api(wrapped_json, provider, CATEGORIES)
-            batch_logs = "Single API call used (no batch processing)."
-        
-        # 4. Extract company info from the OCR text
-        all_text = "\n".join(cleaned_pages)
-        company_info = extract_company_info_from_text(all_text)
-        company_name = company_info.get("company_name", "")
-        cnpj = company_info.get("cnpj", "")
-
-        # 5. Save the analysis result to the database (if available)
-        if result:
-            db = SessionLocal()  # Open a database session
-            new_sheet = BalanceSheet(
-                filename=filename,
-                data=json.dumps(result),
-                company_name=company_name,
-                cnpj=cnpj
-            )
-            db.add(new_sheet)
-            db.commit()
-            db.close()
-
-            # Save analysis result files for download
-            analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
-            with open(analysis_json_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, indent=2, ensure_ascii=False, default=lambda x: "NaN" if math.isnan(x) else x)
-            df = pd.DataFrame.from_dict(result, orient="index").T
-            analysis_xls_path = os.path.join("output", f"{filename}_analysis.xlsx")
-            df.to_excel(analysis_xls_path)
-            
-            download_analysis_link = url_for("download_file", filename=f"{filename}_analysis.json")
-            download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
-            download_xls_link = url_for("download_file", filename=f"{filename}_analysis.xlsx")
-        else:
-            download_analysis_link = None
-            download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
-            download_xls_link = None
-            batch_logs += "\nNo analysis result obtained."
-        
-        return render_template_string(RESULT_HTML,
-                                      filename=filename,
-                                      download_analysis_link=download_analysis_link,
-                                      download_ocr_link=download_ocr_link,
-                                      download_xls_link=download_xls_link,
-                                      batch_logs=batch_logs)
+        # Enqueue the processing task via Celery
+        task = process_balance_sheet.delay(filename, upload_path, provider, CATEGORIES)
+        # Redirect to a processing page with task ID (the page will poll for status)
+        return render_template_string(PROCESSING_HTML, task_id=task.id)
     except Exception as e:
         logger.exception("Error processing uploaded file:")
         return "Internal Server Error", 500
+
+@app.route("/task_status/<task_id>")
+def task_status(task_id):
+    from celery.result import AsyncResult
+    res = AsyncResult(task_id)
+    response = {
+        "state": res.state,
+        "meta": res.info if res.info else {}
+    }
+    return jsonify(response)
 
 @app.route("/download/<path:filename>")
 def download_file(filename: str):
@@ -334,6 +407,25 @@ def search():
         return render_template_string(RESULTS_HTML, results=results, company_name=company_name, cnpj=cnpj)
     else:
         return render_template_string(SEARCH_HTML)
+
+@app.route("/view/<int:sheet_id>", methods=["GET"])
+def view_sheet(sheet_id: int):
+    from db import SessionLocal
+    from models import BalanceSheet
+    db = SessionLocal()
+    sheet = db.query(BalanceSheet).get(sheet_id)
+    db.close()
+    if sheet:
+        try:
+            data = json.loads(sheet.data)
+        except Exception as e:
+            logger.exception("Error parsing sheet data: %s", e)
+            data = {}
+        # Calculate processing time if available in the data meta (assuming your task stored it)
+        processing_time = data.get("processing_time", "N/A")
+        return render_template_string(VIEW_HTML, sheet=sheet, data=data, processing_time=processing_time)
+    else:
+        return "Record not found", 404
 
 if __name__ == "__main__":
     init_db()  # Initialize the database and create tables if they don't exist

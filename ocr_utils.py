@@ -15,7 +15,7 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     try:
         gray = img.convert('L')
         enhancer = ImageEnhance.Contrast(gray)
-        gray = enhancer.enhance(2)  # Adjust the factor as needed
+        gray = enhancer.enhance(2)  # Adjust factor as needed
         gray = gray.filter(ImageFilter.MedianFilter())
         return gray
     except Exception as e:
@@ -36,8 +36,7 @@ def post_process_text(text: str) -> str:
 
 def reorder_line(line: str, categories: List[str]) -> str:
     """
-    If a line contains one of the expected category keywords, remove it and
-    then prepend it to the line.
+    If a line contains one of the expected category keywords, remove it and then prepend it to the line.
     """
     try:
         found = None
@@ -77,7 +76,6 @@ def wrap_pages_in_json(pages: List[str]) -> str:
     try:
         doc = {"document": {"pages": []}}
         for idx, page_text in enumerate(pages, start=1):
-            # Split the page text into lines and remove empty lines.
             lines = [line.strip() for line in page_text.splitlines() if line.strip()]
             doc["document"]["pages"].append({"page_number": idx, "lines": lines})
         return json.dumps(doc, ensure_ascii=False, indent=2)
@@ -87,12 +85,13 @@ def wrap_pages_in_json(pages: List[str]) -> str:
 
 def extract_company_info_from_text(text: str) -> Dict[str, str]:
     """
-    Improved extraction of company name and CNPJ from OCR text.
+    Extract the company name and CNPJ from OCR text.
     
-    For the company name, this function takes the first non-empty line,
-    removes any leading numbers and spaces, and treats the remainder as the company name.
-    
-    For the CNPJ, it uses a regex to capture a standard formatted CNPJ.
+    This function first splits the text into lines and then:
+      - If it finds a line with "CNPJ:", it attempts to use the previous line as the company name,
+        but only if that line ends with a common corporate suffix (LTDA, SA, or S/A).
+      - If that doesn't work, it scans all lines for one that ends with one of these suffixes.
+      - The CNPJ is extracted using a regex that captures a common formatted CNPJ.
     
     Returns:
         A dictionary with keys 'company_name' and 'cnpj'.
@@ -101,19 +100,39 @@ def extract_company_info_from_text(text: str) -> Dict[str, str]:
         company_name = ""
         cnpj = ""
         
-        # Split the text into lines and take the first non-empty line as a candidate for the company name.
+        # Split text into non-empty lines.
         lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if lines:
-            # Assume the first line is something like "3013 ALNITAK COMERCIO DE ARTIGOS PARA CASA LTDA"
-            first_line = lines[0]
-            # Remove any leading digits and spaces (e.g., "3013 ")
-            company_name = re.sub(r"^\d+\s*", "", first_line).strip()
         
-        # Use regex to extract the CNPJ. This pattern expects the label "CNPJ:" followed by a CNPJ.
-        cnpj_pattern = r"CNPJ:\s*([\d]{2}\.[\d]{3}\.[\d]{3}/[\d]{4}-[\d]{2})"
-        cnpj_match = re.search(cnpj_pattern, text, re.IGNORECASE)
-        if cnpj_match:
-            cnpj = cnpj_match.group(1).strip()
+        # Define a pattern that matches common company suffixes.
+        suffix_pattern = re.compile(r".*(LTDA|S/?A)$", re.IGNORECASE)
+        
+        # First, if there's a line containing "CNPJ:", try to use the previous line if it ends with a common suffix.
+        for i, line in enumerate(lines):
+            if "CNPJ:" in line.upper():
+                # Attempt to extract CNPJ from this line.
+                cnpj_match = re.search(r"CNPJ:\s*([\d]{2}[.\-\/\s]*[\d]{3}[.\-\/\s]*[\d]{3}[.\-\/\s]*[\d]{4}[-\s]*[\d]{2})", line, re.IGNORECASE)
+                if cnpj_match:
+                    raw_cnpj = cnpj_match.group(1)
+                    cnpj_digits = re.sub(r"[^\d]", "", raw_cnpj)
+                    if len(cnpj_digits) == 14:
+                        cnpj = f"{cnpj_digits[:2]}.{cnpj_digits[2:5]}.{cnpj_digits[5:8]}/{cnpj_digits[8:12]}-{cnpj_digits[12:]}"
+                    else:
+                        cnpj = cnpj_digits
+                # Use the previous line as candidate, if it exists and ends with a common suffix.
+                if i > 0:
+                    candidate = lines[i - 1]
+                    candidate_clean = re.sub(r"^\d+\s*", "", candidate)  # Remove leading digits
+                    if suffix_pattern.search(candidate_clean):
+                        company_name = candidate_clean.strip()
+                        break
+        
+        # If we haven't found a company name via the above method, scan all lines for a candidate ending with a common suffix.
+        if not company_name:
+            for line in lines:
+                candidate = re.sub(r"^\d+\s*", "", line)
+                if suffix_pattern.search(candidate):
+                    company_name = candidate.strip()
+                    break
         
         return {"company_name": company_name, "cnpj": cnpj}
     except Exception as e:
