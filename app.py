@@ -9,12 +9,10 @@ from flask import Flask, request, render_template_string, send_from_directory, u
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
-# Import custom modules
+# Import our custom modules for processing and database
 from pdf_processor import extract_text
 from ocr_utils import clean_ocr_text, wrap_pages_in_json
 from api_integration import analyze_with_api, analyze_document_in_batches
-
-# Import database setup and model
 from db import init_db, SessionLocal
 from models import BalanceSheet
 
@@ -42,7 +40,8 @@ def load_categories() -> list:
 
 CATEGORIES = load_categories()
 
-# HTML templates for upload and result pages
+# HTML templates
+
 UPLOAD_HTML = """
 <!doctype html>
 <html lang="en">
@@ -58,6 +57,7 @@ UPLOAD_HTML = """
     input[type="file"], select { padding: 10px; width: 100%; margin-bottom: 15px; }
     input[type="submit"] { padding: 10px 20px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
     input[type="submit"]:hover { background: #45a049; }
+    .menu a { margin-right: 15px; }
     .progress { display: none; margin-top: 20px; text-align: center; }
     .progress p { font-size: 16px; color: #555; }
     .progress progress { width: 100%; height: 20px; }
@@ -70,7 +70,11 @@ UPLOAD_HTML = """
 </head>
 <body>
 <div class="container">
-  <h2>Balance Sheet Analyzer</h2>
+  <div class="menu">
+    <a href="/">Home</a> |
+    <a href="/search">Search Balance Sheets</a>
+  </div>
+  <h2>Upload Balance Sheet</h2>
   <form method="post" enctype="multipart/form-data" action="/upload" onsubmit="showProgress()">
     <label for="file">Select a Balance Sheet PDF:</label>
     <input type="file" name="file" id="file">
@@ -106,6 +110,10 @@ RESULT_HTML = """
 </head>
 <body>
 <div class="container">
+  <div class="menu">
+    <a href="/">Home</a> |
+    <a href="/search">Search Balance Sheets</a>
+  </div>
   <h2>Analysis Result for {{ filename }}</h2>
   {% if download_analysis_link %}
     <a href="{{ download_analysis_link }}">Download Analysis JSON File</a>
@@ -120,6 +128,99 @@ RESULT_HTML = """
   <pre>{{ batch_logs }}</pre>
   <br>
   <a href="/">Upload another file</a>
+</div>
+</body>
+</html>
+"""
+
+SEARCH_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Search Balance Sheets</title>
+  <style>
+    body { font-family: Arial, sans-serif; background-color: #f2f2f2; margin: 0; padding: 0; }
+    .container { width: 80%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    input[type="text"] { width: 100%; padding: 10px; margin: 10px 0; }
+    input[type="submit"] { padding: 10px 20px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; }
+    input[type="submit"]:hover { background: #45a049; }
+    .menu a { margin-right: 15px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="menu">
+    <a href="/">Home</a> |
+    <a href="/search">Search Balance Sheets</a>
+  </div>
+  <h2>Search Balance Sheets</h2>
+  <form method="POST" action="/search">
+    <label for="company_name">Company Name:</label>
+    <input type="text" name="company_name" id="company_name" placeholder="Enter company name">
+    <label for="cnpj">CNPJ:</label>
+    <input type="text" name="cnpj" id="cnpj" placeholder="Enter CNPJ">
+    <input type="submit" value="Search">
+  </form>
+  <br>
+  <a href="/">Back to Home</a>
+</div>
+</body>
+</html>
+"""
+
+RESULTS_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Search Results</title>
+  <style>
+    body { font-family: Arial, sans-serif; background-color: #f2f2f2; margin: 0; padding: 0; }
+    .container { width: 80%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #4CAF50; color: white; }
+    .menu a { margin-right: 15px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="menu">
+    <a href="/">Home</a> |
+    <a href="/search">Search Balance Sheets</a>
+  </div>
+  <h2>Search Results for "{{ company_name }}" and "{{ cnpj }}"</h2>
+  {% if results %}
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Filename</th>
+          <th>Company Name</th>
+          <th>CNPJ</th>
+          <th>Created At</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for sheet in results %}
+        <tr>
+          <td>{{ sheet.id }}</td>
+          <td>{{ sheet.filename }}</td>
+          <td>{{ sheet.company_name }}</td>
+          <td>{{ sheet.cnpj }}</td>
+          <td>{{ sheet.created_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p>No results found.</p>
+  {% endif %}
+  <br>
+  <a href="/search">Back to Search</a>
+  <br>
+  <a href="/">Back to Home</a>
 </div>
 </body>
 </html>
@@ -152,7 +253,7 @@ def upload():
         cleaned_pages = [clean_ocr_text(page, CATEGORIES) for page in raw_pages]
         wrapped_json = wrap_pages_in_json(cleaned_pages)
         
-        # Save the OCR JSON for download
+        # Save OCR JSON output for download
         json_text_path = os.path.join("output", f"{filename}_ocr.json")
         with open(json_text_path, "w", encoding="utf-8") as f:
             f.write(wrapped_json)
@@ -168,7 +269,13 @@ def upload():
         # 4. Save the analysis result to the database (if available)
         if result:
             db = SessionLocal()  # Open a database session
-            new_sheet = BalanceSheet(filename=filename, data=json.dumps(result))
+            new_sheet = BalanceSheet(
+                filename=filename,
+                data=json.dumps(result)
+                # If you have a way to extract company name and CNPJ, add them here:
+                # company_name="Extracted Company Name",
+                # cnpj="Extracted CNPJ"
+            )
             db.add(new_sheet)
             db.commit()
             db.close()
@@ -204,6 +311,25 @@ def upload():
 def download_file(filename: str):
     return send_from_directory("output", filename, as_attachment=True)
 
+@app.route("/search", methods=["GET", "POST"])
+def search():
+    from db import SessionLocal
+    from models import BalanceSheet
+    if request.method == "POST":
+        company_name = request.form.get("company_name", "").strip()
+        cnpj = request.form.get("cnpj", "").strip()
+        db = SessionLocal()
+        query = db.query(BalanceSheet)
+        if company_name:
+            query = query.filter(BalanceSheet.company_name.ilike(f"%{company_name}%"))
+        if cnpj:
+            query = query.filter(BalanceSheet.cnpj.ilike(f"%{cnpj}%"))
+        results = query.all()
+        db.close()
+        return render_template_string(RESULTS_HTML, results=results, company_name=company_name, cnpj=cnpj)
+    else:
+        return render_template_string(SEARCH_HTML)
+
 if __name__ == "__main__":
-    init_db()  # Initialize the database and create tables if they don't exist.
+    init_db()  # Initialize the database and create tables if they don't exist
     app.run(host="0.0.0.0", port=8000)
