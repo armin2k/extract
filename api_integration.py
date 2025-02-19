@@ -5,10 +5,11 @@ import logging
 import requests
 from tenacity import retry, wait_exponential, stop_after_attempt
 from data_parser import format_financial_data, merge_analysis_results
+from ocr_utils import wrap_pages_in_json  # Ensure this import is present
 
 logger = logging.getLogger(__name__)
 
-# Create a persistent session for all API calls.
+# Create a persistent session for API calls.
 session = requests.Session()
 
 def get_api_parameters(provider: str):
@@ -20,7 +21,7 @@ def get_api_parameters(provider: str):
         headers = {}
         model = "deepseek-r1:14b"
         timeout_value = 240
-    else:  # Default to ChatGPT API
+    else:
         api_key = os.getenv("OPENAI_API_KEY")
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -41,12 +42,11 @@ def make_api_call(url: str, headers: dict, payload: dict, timeout_value: int):
 def analyze_with_api(text_json: str, provider: str, categories: list):
     """
     Analyze the provided OCR JSON using the chosen API.
-    Constructs a prompt using the categories and text_json,
-    makes the API call, and formats the response.
+    Constructs a prompt using the categories and text_json, makes the API call, and formats the response.
     """
     prompt = f"""
-Você é um especialista em contabilidade brasileira. Extraia os dados financeiros relevantes a partir do seguinte documento JSON.
-Retorne apenas um objeto JSON com os valores extraídos.
+Você é um especialista em contabilidade brasileira. Extraia os dados financeiros relevantes a partir do documento JSON a seguir.
+Retorne somente um objeto JSON com os valores extraídos.
 
 Categorias:
 {json.dumps(categories, indent=4, ensure_ascii=False)}
@@ -55,11 +55,7 @@ Documento (em JSON):
 {text_json}
     """
     url, headers, model, timeout_value = get_api_parameters(provider)
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1
-    }
+    payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
     try:
         response_json = make_api_call(url, headers, payload, timeout_value)
         return format_financial_data(response_json, categories)
@@ -75,7 +71,6 @@ def analyze_document_in_batches(text_json: str, provider: str, categories: list,
     logs = []
     try:
         doc_data = json.loads(text_json)
-        # If the JSON has a 'document' with 'pages', combine all lines from all pages.
         if isinstance(doc_data.get("document"), dict) and "pages" in doc_data["document"]:
             doc = "\n".join(["\n".join(page.get("lines", [])) for page in doc_data["document"]["pages"]])
         else:
@@ -84,17 +79,16 @@ def analyze_document_in_batches(text_json: str, provider: str, categories: list,
         logs.append(f"Error parsing JSON: {e}")
         return {}, "\n".join(logs)
     
-    # Create batches with the specified overlap.
+    # Create overlapping batches.
     batches = []
     start = 0
     while start < len(doc):
         end = start + batch_size
         batches.append(doc[start:end])
         start = end - overlap
-    
     logs.append(f"Created {len(batches)} batches (batch_size={batch_size}, overlap={overlap}).")
     
-    # Process batches concurrently using a ThreadPoolExecutor.
+    # Process batches concurrently.
     import concurrent.futures
     results = []
     max_workers = min(32, (os.cpu_count() or 1) * 2)
@@ -116,7 +110,6 @@ def analyze_document_in_batches(text_json: str, provider: str, categories: list,
                     logs.append(f"Batch {idx} returned no result.")
             except Exception as e:
                 logs.append(f"Batch {idx} raised an exception: {e}")
-    
     if results:
         merged_result = merge_analysis_results(results, categories)
         logs.append("Merged results from batches successfully.")
