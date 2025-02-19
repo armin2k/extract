@@ -1,5 +1,8 @@
 # tasks.py
 import os
+logger.info("CELERY_BROKER_URL: %s", os.getenv('CELERY_BROKER_URL'))
+logger.info("CELERY_RESULT_BACKEND: %s", os.getenv('CELERY_RESULT_BACKEND'))
+logger.info("OPENAI_API_KEY: %s", os.getenv('OPENAI_API_KEY'))
 import json
 import logging
 import math
@@ -9,12 +12,17 @@ from ocr_utils import clean_ocr_text, wrap_pages_in_json, extract_company_info_f
 from api_integration import analyze_with_api, analyze_document_in_batches
 from db import SessionLocal
 from models import BalanceSheet
+from dotenv import load_dotenv
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 # Create a Celery instance. Adjust the broker URL as needed.
-celery = Celery('tasks', broker=os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0'))
-
+celery = Celery(
+    'tasks',
+    broker=os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
+    backend=os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
+)
 @celery.task(bind=True)
 def process_balance_sheet(self, filename, upload_path, provider, categories):
     try:
