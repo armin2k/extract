@@ -11,3 +11,4 @@ Pillow==11.1.0
 tenacity==8.2.2
 SQLAlchemy==1.4.46
 celery==5.2.7
+psycopg2-binary==2.9.6

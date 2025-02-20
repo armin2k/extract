@@ -1,38 +1,74 @@
 import os
+import re
 import json
 import math
 import time
+import datetime
 import requests
-import re
-import pandas as pd  # For converting JSON to XLS
-from PyPDF2 import PdfReader
-from pdf2image import convert_from_path
-import pytesseract
-from dotenv import load_dotenv
-import concurrent.futures
+import pandas as pd
 import logging
-from flask import Flask, request, render_template_string, send_from_directory, url_for
-from werkzeug.utils import secure_filename  # For secure file names
-from PIL import Image, ImageEnhance, ImageFilter  # For image pre-processing
-from tenacity import retry, wait_exponential, stop_after_attempt  # For exponential backoff
+import concurrent.futures
+
+from flask import Flask, request, render_template_string, send_from_directory, url_for, redirect
+from werkzeug.utils import secure_filename
+from dotenv import load_dotenv
+from PIL import Image, ImageEnhance, ImageFilter
+from pdf2image import convert_from_path
+from PyPDF2 import PdfReader
+import pytesseract
+from tenacity import retry, wait_exponential, stop_after_attempt
+
+# For image pre-processing enhancements
+import cv2
+import numpy as np
+
+# SQLAlchemy imports for PostgreSQL integration
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
 # -------------------------------
-# Configuration and Logging Setup
+# Load configuration and set up logging
 # -------------------------------
 load_dotenv()
+
+APP_VERSION = "v1.0.1"  # Displayed in the browser footer
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# External configuration values from .env file
+# Environment variables for external tools and database
 POPPLER_PATH = os.getenv("POPPLER_PATH", "/opt/homebrew/bin")
 SCALE_FACTOR = int(os.getenv("SCALE_FACTOR", 1))
 CATEGORIES_FILE = "categories.json"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://armin@localhost/balancesheetdb")
 
+# -------------------------------
+# SQLAlchemy setup
+# -------------------------------
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class BalanceSheetAnalysis(Base):
+    __tablename__ = "balance_sheet_analysis"
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, index=True)  # Original filename
+    company_name = Column(String, index=True)
+    cnpj = Column(String, index=True)
+    analysis_data = Column(JSON)
+    ocr_data = Column(JSON)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+# Create the table if it doesn't exist
+Base.metadata.create_all(bind=engine)
+
+# -------------------------------
+# Load Categories and precompile regex patterns
+# -------------------------------
 def load_categories() -> list:
-    """Load categories from a JSON file."""
     try:
         with open(CATEGORIES_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -42,30 +78,48 @@ def load_categories() -> list:
         return []
 
 CATEGORIES = load_categories()
-
-# Precompile regex patterns for categories to speed up matching
 CATEGORY_PATTERNS = [(cat, re.compile(re.escape(cat), re.IGNORECASE)) for cat in CATEGORIES]
 
 # -------------------------------
 # Image Pre-processing Functions
 # -------------------------------
+def deskew_image(img: Image.Image) -> Image.Image:
+    try:
+        img_np = np.array(img.convert('L'))
+        coords = np.column_stack(np.where(img_np > 0))
+        if coords.size == 0:
+            return img
+        angle = cv2.minAreaRect(coords)[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+        (h, w) = img_np.shape
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(img_np, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        return Image.fromarray(rotated)
+    except Exception as e:
+        logging.error(f"Deskewing failed: {e}")
+        return img
+
 def preprocess_image(img: Image.Image) -> Image.Image:
-    """
-    Pre-process the PIL image to improve OCR results.
-    Converts to grayscale, enhances contrast, and applies a median filter.
-    """
+    try:
+        img = deskew_image(img)
+    except Exception as e:
+        logging.error(f"Error during deskewing: {e}")
     gray = img.convert('L')
     enhancer = ImageEnhance.Contrast(gray)
     gray = enhancer.enhance(2)
     gray = gray.filter(ImageFilter.MedianFilter())
-    return gray
+    img_np = np.array(gray)
+    bin_img = cv2.adaptiveThreshold(
+        img_np, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
+    )
+    return Image.fromarray(bin_img)
 
 def post_process_text(text: str) -> str:
-    """
-    Apply post-processing corrections to the OCR text.
-    For example, replace common misinterpretations.
-    """
-    # Replace an uppercase 'O' with zero '0' in numeric contexts.
     text = re.sub(r'(?<=\d)O(?=\d)', '0', text)
     return text
 
@@ -73,16 +127,10 @@ def post_process_text(text: str) -> str:
 # PDF and OCR Processing Functions
 # -------------------------------
 def extract_text(pdf_path: str) -> str:
-    """
-    Extract text from a PDF using PyPDF2; if that fails, fall back to OCR.
-    Iterates page by page to reduce memory usage.
-    Returns the extracted text.
-    """
     text = ""
     try:
         with open(pdf_path, "rb") as f:
             reader = PdfReader(f)
-            # Process one page at a time
             for page in reader.pages:
                 page_text = page.extract_text() or ""
                 text += page_text + "\n"
@@ -90,28 +138,22 @@ def extract_text(pdf_path: str) -> str:
                 return text
     except Exception as e:
         logging.error(f"Standard extraction failed: {e}")
-
-    # If standard extraction fails, use OCR
     try:
-        # Increase DPI for better resolution (300 DPI recommended)
         images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH, dpi=300)
         ocr_text = []
         custom_config = "--psm 6 --oem 3"
-        for img in images:
+        for idx, img in enumerate(images):
             processed_img = preprocess_image(img)
             text_img = pytesseract.image_to_string(processed_img, lang='por', config=custom_config)
             text_img = post_process_text(text_img)
             ocr_text.append(text_img)
+            logging.info(f"OCR completed for page {idx+1}.")
         return "\n".join(ocr_text)
     except Exception as e:
         logging.error(f"OCR failed: {e}")
         return ""
 
 def reorder_line(line: str, categories: list) -> str:
-    """
-    If a line contains one of the expected category keywords,
-    remove it from its current position and prepend it.
-    """
     found = None
     for cat, pattern in CATEGORY_PATTERNS:
         if pattern.search(line):
@@ -123,25 +165,18 @@ def reorder_line(line: str, categories: list) -> str:
     return re.sub(r'\s+', ' ', line).strip()
 
 def clean_ocr_text(raw_text: str, categories: list) -> str:
-    """
-    Clean the OCR text while preserving formatting.
-    Keeps only lines longer than 10 characters that contain at least one digit
-    or one of the expected category keywords; also removes URLs.
-    Each kept line is reordered so that the category appears at the beginning.
-    """
     cleaned_lines = []
     for line in raw_text.splitlines():
-        line = re.sub(r"http\S+", "", line)  # Remove URLs
+        line = re.sub(r"http\S+", "", line)
         if len(line) > 10 and (re.search(r'\d', line.lstrip()) or any(cat.lower() in line.lower() for cat in categories)):
             cleaned_lines.append(reorder_line(line, categories))
     return "\n".join(cleaned_lines)
 
 def wrap_text_in_json(text: str) -> str:
-    """
-    Wrap the cleaned OCR text in a JSON structure that preserves formatting.
-    Splits the text into lines and stores them in a "lines" array under "document".
-    """
-    lines = [line for line in text.splitlines() if line.strip() != ""]
+    lines = []
+    for idx, line in enumerate(text.splitlines()):
+        if line.strip():
+            lines.append({"line_number": idx+1, "text": line.strip()})
     wrapped = {"document": {"lines": lines}}
     return json.dumps(wrapped, ensure_ascii=False, indent=2)
 
@@ -149,10 +184,6 @@ def wrap_text_in_json(text: str) -> str:
 # Data Parsing Functions
 # -------------------------------
 def parse_value(value) -> float:
-    """
-    Convert Brazilian-formatted numbers (as strings) to float.
-    Applies the SCALE_FACTOR.
-    """
     if value in [None, "NaN", ""]:
         return math.nan
     if isinstance(value, str):
@@ -180,11 +211,6 @@ def parse_value(value) -> float:
         return math.nan
 
 def extract_json_from_text(text: str) -> str:
-    """
-    Extract a JSON block from the text.
-    Searches for content enclosed in triple backticks; if not found,
-    extracts from the first "{" to the last "}".
-    """
     candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     for candidate in candidates:
         try:
@@ -205,11 +231,6 @@ def extract_json_from_text(text: str) -> str:
     return None
 
 def format_financial_data(response_json: dict, categories: list) -> dict:
-    """
-    Convert the API response into a structured JSON object.
-    If the API returns a flat dictionary (with keys matching the categories),
-    wrap it under "Ano Desconhecido".
-    """
     try:
         content = response_json.get('choices', [{}])[0].get('message', {}).get('content', '')
         if not content.strip():
@@ -239,19 +260,62 @@ def format_financial_data(response_json: dict, categories: list) -> dict:
         return None
 
 # -------------------------------
+# Checksum Validation Function
+# -------------------------------
+def validate_checksums(data: dict) -> dict:
+    checksum_report = {}
+    tolerance = 0.01
+    for year, values in data.items():
+        report = {}
+        ativo_total = values.get("Ativo Total")
+        if ativo_total is None or math.isnan(ativo_total):
+            report["ativo"] = "Ativo Total is missing or NaN"
+        else:
+            sum_ativo = 0.0
+            ativo_found = False
+            for key, value in values.items():
+                if key.startswith("Ativo") and key != "Ativo Total":
+                    if not math.isnan(value):
+                        sum_ativo += value
+                        ativo_found = True
+            if ativo_found:
+                if abs(sum_ativo - ativo_total) > tolerance:
+                    report["ativo"] = f"Checksum error: sum of Ativo items is {sum_ativo}, expected {ativo_total}."
+                else:
+                    report["ativo"] = "OK"
+            else:
+                report["ativo"] = "No Ativo line items found for checksum validation"
+        passivo_total = values.get("Passivo Total")
+        if passivo_total is None or math.isnan(passivo_total):
+            report["passivo"] = "Passivo Total is missing or NaN"
+        else:
+            sum_passivo = 0.0
+            passivo_found = False
+            for key, value in values.items():
+                if key.startswith("Passivo") and key != "Passivo Total":
+                    if not math.isnan(value):
+                        sum_passivo += value
+                        passivo_found = True
+            if passivo_found:
+                if abs(sum_passivo - passivo_total) > tolerance:
+                    report["passivo"] = f"Checksum error: sum of Passivo items is {sum_passivo}, expected {passivo_total}."
+                else:
+                    report["passivo"] = "OK"
+            else:
+                report["passivo"] = "No Passivo line items found for checksum validation"
+        checksum_report[year] = report
+    return checksum_report
+
+# -------------------------------
 # API Integration Functions with Retry
 # -------------------------------
 def get_api_parameters(provider: str) -> tuple:
-    """
-    Returns API parameters (URL, headers, model, timeout) based on the chosen provider.
-    Checks that necessary environment variables are set.
-    """
     if provider == "deepseek":
         url = "http://localhost:11434/v1/chat/completions"
         headers = {}
         model = "deepseek-r1:14b"
         timeout_value = 240
-    else:  # ChatGPT branch
+    else:
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
             logging.error("OPENAI_API_KEY is not set in environment variables.")
@@ -263,19 +327,12 @@ def get_api_parameters(provider: str) -> tuple:
 
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
 def make_api_call(url: str, headers: dict, payload: dict, timeout_value: int) -> dict:
-    """
-    Make an API call with the given parameters.
-    This function is decorated with tenacity to retry on transient errors.
-    """
     response = requests.post(url, headers=headers, json=payload, timeout=timeout_value)
     if response.status_code != 200:
         raise Exception(f"API call failed with status code {response.status_code}: {response.text}")
     return response.json()
 
 def analyze_with_api(text_json: str, provider: str, categories: list) -> dict:
-    """
-    Analyze the provided OCR text (wrapped in JSON) using the chosen API.
-    """
     prompt = f"""
 Você é um especialista em contabilidade brasileira. A seguir, é fornecido um balanço patrimonial extraído por OCR, com a formatação preservada num objeto JSON.
 Extraia somente os dados financeiros relevantes, convertendo "1.234,56" para 1234.56 e "(1.234,56)" para -1234.56; use NaN para valores ausentes.
@@ -283,7 +340,7 @@ Se houver dados de múltiplos anos, utilize os anos (4 dígitos) como chaves; ca
 Retorne APENAS um objeto JSON com os valores extraídos.
 
 Categorias:
-{json.dumps(categories, indent=4, ensure_ascii=False)}
+{json.dumps(CATEGORIES, indent=4, ensure_ascii=False)}
 
 Documento (em JSON):
 {text_json}
@@ -296,16 +353,12 @@ Documento (em JSON):
     }
     try:
         response_json = make_api_call(url, headers, payload, timeout_value)
-        return format_financial_data(response_json, categories)
+        return format_financial_data(response_json, CATEGORIES)
     except Exception as e:
         logging.error(f"API Error: {e}")
         return None
 
 def merge_analysis_results(results: list, categories: list) -> dict:
-    """
-    Merge multiple API responses (each a dict with year keys) into one JSON object.
-    For each accounting year, non-NaN values are preferred.
-    """
     merged = {}
     for result in results:
         if not result:
@@ -321,39 +374,44 @@ def merge_analysis_results(results: list, categories: list) -> dict:
                         merged[year][category] = new_val
     return merged
 
-def analyze_document_in_batches(text_json: str, provider: str, categories: list, batch_size: int = 10000, overlap: int = 500) -> tuple:
-    """
-    Split the wrapped OCR JSON text into overlapping batches (by character count)
-    and analyze each batch concurrently.
-    Returns a tuple: (merged JSON analysis, batch processing logs)
-    """
+# -------------------------------
+# Batch Processing Functions
+# -------------------------------
+def create_batches(doc: str, batch_size: int, overlap_lines: int) -> list:
+    lines = doc.splitlines()
+    batches = []
+    start = 0
+    while start < len(lines):
+        char_count = 0
+        end = start
+        while end < len(lines) and (char_count + len(lines[end]) <= batch_size):
+            char_count += len(lines[end])
+            end += 1
+        batch = "\n".join(lines[start:end])
+        batches.append(batch)
+        start = max(0, end - overlap_lines)
+    return batches
+
+def analyze_document_in_batches(text_json: str, provider: str, categories: list, batch_size: int = 10000, overlap_lines: int = 3) -> tuple:
     logs = []
     try:
         doc_data = json.loads(text_json)
         if isinstance(doc_data.get("document"), dict) and "lines" in doc_data["document"]:
-            doc = "\n".join(doc_data["document"]["lines"])
+            doc = "\n".join(line["text"] for line in doc_data["document"]["lines"])
         else:
             doc = doc_data.get("document", "")
     except Exception as e:
         logs.append(f"Error loading wrapped JSON: {e}")
         return None, "\n".join(logs)
-
-    batches = []
-    start = 0
-    while start < len(doc):
-        end = start + batch_size
-        batches.append(doc[start:end])
-        start = end - overlap
-    logs.append(f"Created {len(batches)} batches (batch_size={batch_size}, overlap={overlap}).")
-
+    batches = create_batches(doc, batch_size, overlap_lines)
+    logs.append(f"Created {len(batches)} batches (batch_size={batch_size}, overlap_lines={overlap_lines}).")
     results = []
     total_batches = len(batches)
-    # Dynamically set max_workers based on system capabilities.
     max_workers = min(32, (os.cpu_count() or 1) * 2)
     logs.append(f"Processing {total_batches} batches concurrently (max_workers={max_workers}).")
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_index = {
-            executor.submit(analyze_with_api, wrap_text_in_json(batch), provider, categories): i+1
+            executor.submit(analyze_with_api, wrap_text_in_json(batch), provider, CATEGORIES): i + 1
             for i, batch in enumerate(batches)
         }
         for future in concurrent.futures.as_completed(future_to_index):
@@ -368,7 +426,7 @@ def analyze_document_in_batches(text_json: str, provider: str, categories: list,
             except Exception as exc:
                 logs.append(f"Batch {i} generated an exception: {exc}")
     if results:
-        merged_result = merge_analysis_results(results, categories)
+        merged_result = merge_analysis_results(results, CATEGORIES)
         logs.append("Merged results from batches successfully.")
         return merged_result, "\n".join(logs)
     else:
@@ -376,13 +434,49 @@ def analyze_document_in_batches(text_json: str, provider: str, categories: list,
         return None, "\n".join(logs)
 
 # -------------------------------
-# Flask Web Application
+# Company Info Extraction
+# -------------------------------
+def extract_company_info(ocr_text: str, filename: str) -> dict:
+    """
+    Attempt to extract the company name and CNPJ from the OCR text.
+    
+    - For CNPJ: Looks for a pattern like 'XX.XXX.XXX/0001-XX'.
+    - For company name: Searches for keywords ("Razão Social", "Empresa", "Entidade")
+      followed by a separator and captures text ending with common suffixes (LTDA, S/A, or SA).
+    - If not found, falls back to using the filename:
+      It extracts the substring from the start of the filename until the first digit.
+    """
+    # Pattern to extract CNPJ
+    cnpj_pattern = r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}'
+    cnpj_match = re.search(cnpj_pattern, ocr_text)
+    cnpj = cnpj_match.group() if cnpj_match else None
+
+    # Pattern to extract company name using keywords and legal suffixes
+    company_pattern = r'(?:Razão Social|Empresa|Entidade)[:\-]\s*([^\n]+?(?:LTDA|Ltda|ltda|S/A|s/a|SA|sa))'
+    company_match = re.search(company_pattern, ocr_text, re.IGNORECASE)
+    if company_match:
+        company_name = company_match.group(1).strip()
+    else:
+        # Fallback: use the filename
+        base = os.path.splitext(filename)[0]  # remove .pdf extension
+        # Extract from the start of the filename until the first digit
+        fallback_match = re.search(r'^([^\d]+)', base)
+        if fallback_match:
+            company_name = fallback_match.group(1).strip()
+        else:
+            company_name = base.strip()
+
+    return {"company_name": company_name, "cnpj": cnpj}
+
+# -------------------------------
+# Flask Web Application and New Routes
 # -------------------------------
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs("output", exist_ok=True)
 
+# Landing page with navigation
 UPLOAD_HTML = """
 <!doctype html>
 <html lang="en">
@@ -391,16 +485,11 @@ UPLOAD_HTML = """
   <title>Balance Sheet Analyzer</title>
   <style>
     body { font-family: Arial, sans-serif; background-color: #f2f2f2; margin: 0; padding: 0; }
+    .navbar { background-color: #333; overflow: hidden; }
+    .navbar a { float: left; display: block; color: #f2f2f2; text-align: center; padding: 14px 16px; text-decoration: none; }
+    .navbar a:hover { background-color: #ddd; color: black; }
     .container { width: 80%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-    h2 { color: #333; }
-    form { margin-top: 20px; }
-    label { display: block; margin-bottom: 5px; }
-    input[type="file"], select { padding: 10px; width: 100%; margin-bottom: 15px; }
-    input[type="submit"] { padding: 10px 20px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
-    input[type="submit"]:hover { background: #45a049; }
-    .progress { display: none; margin-top: 20px; text-align: center; }
-    .progress p { font-size: 16px; color: #555; }
-    .progress progress { width: 100%; height: 20px; }
+    footer { text-align: center; margin-top: 20px; font-size: 14px; color: #777; }
   </style>
   <script>
     function showProgress() {
@@ -409,8 +498,12 @@ UPLOAD_HTML = """
   </script>
 </head>
 <body>
+<div class="navbar">
+  <a href="/">Upload</a>
+  <a href="/search_page">Search</a>
+</div>
 <div class="container">
-  <h2>Balance Sheet Analyzer</h2>
+  <h2>Balance Sheet Analyzer - Upload a PDF</h2>
   <form method="post" enctype="multipart/form-data" action="/upload" onsubmit="showProgress()">
     <label for="file">Select a Balance Sheet PDF:</label>
     <input type="file" name="file" id="file">
@@ -421,11 +514,49 @@ UPLOAD_HTML = """
     </select>
     <input type="submit" value="Upload">
   </form>
-  <div class="progress" id="progressDiv">
+  <div class="progress" id="progressDiv" style="display:none;">
     <p>Processing... please wait.</p>
-    <progress value="0" max="100" id="progressBar"></progress>
   </div>
 </div>
+<footer>Version: {{ version }}</footer>
+</body>
+</html>
+"""
+
+# Search form page
+SEARCH_PAGE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Search Balance Sheets</title>
+  <style>
+    body { font-family: Arial, sans-serif; background-color: #f2f2f2; margin: 0; padding: 0; }
+    .navbar { background-color: #333; overflow: hidden; }
+    .navbar a { float: left; display: block; color: #f2f2f2; text-align: center; padding: 14px 16px; text-decoration: none; }
+    .navbar a:hover { background-color: #ddd; color: black; }
+    .container { width: 80%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    footer { text-align: center; margin-top: 20px; font-size: 14px; color: #777; }
+  </style>
+</head>
+<body>
+<div class="navbar">
+  <a href="/">Upload</a>
+  <a href="/search_page">Search</a>
+</div>
+<div class="container">
+  <h2>Search Balance Sheets</h2>
+  <form method="get" action="/search_results">
+    <label for="company">Company Name:</label>
+    <input type="text" id="company" name="company" placeholder="Enter company name">
+    <br><br>
+    <label for="cnpj">CNPJ:</label>
+    <input type="text" id="cnpj" name="cnpj" placeholder="Enter CNPJ">
+    <br><br>
+    <input type="submit" value="Search">
+  </form>
+</div>
+<footer>Version: {{ version }}</footer>
 </body>
 </html>
 """
@@ -435,39 +566,229 @@ RESULT_HTML = """
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Analysis Result</title>
+  <title>Upload Result</title>
   <style>
     body { font-family: Arial, sans-serif; background-color: #f2f2f2; margin: 0; padding: 0; }
+    .navbar { background-color: #333; overflow: hidden; }
+    .navbar a { float: left; display: block; color: #f2f2f2; text-align: center; padding: 14px 16px; text-decoration: none; }
+    .navbar a:hover { background-color: #ddd; color: black; }
     .container { width: 80%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); text-align: center; }
-    a { display: block; margin: 15px 0; font-size: 18px; color: #4CAF50; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    pre { background: #f9f9f9; border: 1px solid #ddd; padding: 10px; text-align: left; overflow-x: auto; font-size: 14px; }
+    footer { text-align: center; margin-top: 20px; font-size: 14px; color: #777; }
   </style>
 </head>
 <body>
+<div class="navbar">
+  <a href="/">Upload</a>
+  <a href="/search_page">Search</a>
+</div>
 <div class="container">
-  <h2>Analysis Result for {{ filename }}</h2>
+  <h2>Upload Result for {{ filename }}</h2>
   {% if download_analysis_link %}
-    <a href="{{ download_analysis_link }}">Download Analysis JSON File</a>
+    <p><a href="{{ download_analysis_link }}">Download Analysis JSON</a></p>
   {% else %}
     <p>No analysis result available.</p>
   {% endif %}
-  <a href="{{ download_ocr_link }}">Download OCR JSON File</a>
+  <p><a href="{{ download_ocr_link }}">Download OCR JSON</a></p>
   {% if download_xls_link %}
-    <a href="{{ download_xls_link }}">Download Analysis XLS File</a>
+    <p><a href="{{ download_xls_link }}">Download Analysis XLS</a></p>
   {% endif %}
   <h3>Batch Processing Logs</h3>
   <pre>{{ batch_logs }}</pre>
   <br>
   <a href="/">Upload another file</a>
 </div>
+<footer>Version: {{ version }}</footer>
+</body>
+</html>
+"""
+
+# Search results page
+SEARCH_RESULTS = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Search Results</title>
+  <style>
+    body { font-family: Arial, sans-serif; background-color: #f2f2f2; margin: 0; padding: 0; }
+    .navbar { background-color: #333; overflow: hidden; }
+    .navbar a { float: left; display: block; color: #f2f2f2; text-align: center; padding: 14px 16px; text-decoration: none; }
+    .navbar a:hover { background-color: #ddd; color: black; }
+    .container { width: 90%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: center; }
+    th { background-color: #4CAF50; color: white; }
+    footer { text-align: center; margin-top: 20px; font-size: 14px; color: #777; }
+  </style>
+</head>
+<body>
+<div class="navbar">
+  <a href="/">Upload</a>
+  <a href="/search_page">Search</a>
+</div>
+<div class="container">
+  <h2>Search Results</h2>
+  {% if results %}
+  <table>
+    <tr>
+      <th>ID</th>
+      <th>Company Name</th>
+      <th>CNPJ</th>
+      <th>Last Updated</th>
+      <th>Details</th>
+    </tr>
+    {% for r in results %}
+    <tr>
+      <td>{{ r.id }}</td>
+      <td>{{ r.company_name }}</td>
+      <td>{{ r.cnpj }}</td>
+      <td>{{ r.created_at }}</td>
+      <td><a href="/record/{{ r.id }}">View Details</a></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+    <p>No records found.</p>
+  {% endif %}
+  <br>
+  <a href="/search_page">Back to Search</a>
+</div>
+<footer>Version: {{ version }}</footer>
+</body>
+</html>
+"""
+
+# Record detail page
+RECORD_DETAIL = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Record Detail</title>
+  <style>
+    body { font-family: Arial, sans-serif; background-color: #f2f2f2; margin: 0; padding: 0; }
+    .navbar { background-color: #333; overflow: hidden; }
+    .navbar a { float: left; display: block; color: #f2f2f2; text-align: center; padding: 14px 16px; text-decoration: none; }
+    .navbar a:hover { background-color: #ddd; color: black; }
+    .container { width: 90%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    /* Tab styling */
+    .tab { overflow: hidden; border-bottom: 1px solid #ccc; }
+    .tab button { background-color: inherit; float: left; border: none; outline: none; cursor: pointer; padding: 14px 16px; transition: 0.3s; font-size: 17px; }
+    .tab button:hover { background-color: #ddd; }
+    .tab button.active { background-color: #ccc; }
+    .tabcontent { display: none; padding: 20px 0; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: center; }
+    th { background-color: #4CAF50; color: white; }
+    footer { text-align: center; margin-top: 20px; font-size: 14px; color: #777; }
+  </style>
+  <script>
+    function openTab(evt, tabName) {
+      var i, tabcontent, tablinks;
+      tabcontent = document.getElementsByClassName("tabcontent");
+      for (i = 0; i < tabcontent.length; i++) {
+        tabcontent[i].style.display = "none";
+      }
+      tablinks = document.getElementsByClassName("tablinks");
+      for (i = 0; i < tablinks.length; i++) {
+        tablinks[i].className = tablinks[i].className.replace(" active", "");
+      }
+      document.getElementById(tabName).style.display = "block";
+      evt.currentTarget.className += " active";
+    }
+    window.onload = function() {
+      document.getElementsByClassName("tablinks")[0].click();
+    }
+  </script>
+</head>
+<body>
+<div class="navbar">
+  <a href="/">Upload</a>
+  <a href="/search_page">Search</a>
+</div>
+<div class="container">
+  <h2>Record Detail (ID: {{ record.id }})</h2>
+  <p><strong>Company Name:</strong> {{ record.company_name }}</p>
+  <p><strong>CNPJ:</strong> {{ record.cnpj }}</p>
+  <p><strong>Last Updated:</strong> {{ record.created_at }}</p>
+  
+  <!-- Tab navigation -->
+  <div class="tab">
+    <button class="tablinks" onclick="openTab(event, 'balance')">Balance Sheet</button>
+    <button class="tablinks" onclick="openTab(event, 'checksum')">Checksum</button>
+  </div>
+  
+  <!-- Balance Sheet Tab -->
+  <div id="balance" class="tabcontent">
+    <h3>Extracted Balance Sheet Information</h3>
+    {% if analysis and sorted_years %}
+    <table>
+      <tr>
+        <th>Category</th>
+        {% for year in sorted_years %}
+        <th>{{ year }}</th>
+        {% endfor %}
+      </tr>
+      {% for category in categories %}
+      <tr>
+        <td>{{ category }}</td>
+        {% for year in sorted_years %}
+        <td>{{ analysis[year].get(category, "NaN") }}</td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+      <p>No analysis data available.</p>
+    {% endif %}
+  </div>
+  
+  <!-- Checksum Tab -->
+  <div id="checksum" class="tabcontent">
+    <h3>Checksum Information</h3>
+    {% if checksum and sorted_years %}
+    <table>
+      <tr>
+        <th>Type</th>
+        {% for year in sorted_years %}
+        <th>{{ year }}</th>
+        {% endfor %}
+      </tr>
+      <tr>
+        <td>Ativo</td>
+        {% for year in sorted_years %}
+        <td>{{ checksum[year].get("ativo", "N/A") }}</td>
+        {% endfor %}
+      </tr>
+      <tr>
+        <td>Passivo</td>
+        {% for year in sorted_years %}
+        <td>{{ checksum[year].get("passivo", "N/A") }}</td>
+        {% endfor %}
+      </tr>
+    </table>
+    {% else %}
+      <p>No checksum data available.</p>
+    {% endif %}
+  </div>
+  
+  <h3>Downloads</h3>
+  <ul>
+    <li><a href="{{ download_analysis_link }}">Download Analysis JSON</a></li>
+    <li><a href="{{ download_xls_link }}">Download Analysis XLS</a></li>
+    <li><a href="{{ download_ocr_link }}">Download OCR JSON</a></li>
+  </ul>
+  <br>
+  <a href="/search_page">Back to Search</a>
+</div>
+<footer>Version: {{ version }}</footer>
 </body>
 </html>
 """
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(UPLOAD_HTML)
+    return render_template_string(UPLOAD_HTML, version=APP_VERSION)
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -498,22 +819,37 @@ def upload():
         logging.error(f"Error writing OCR JSON file: {e}")
     
     if len(cleaned_text) > 10000:
-        result, batch_logs = analyze_document_in_batches(wrapped_json, provider, CATEGORIES, batch_size=10000, overlap=500)
+        result, batch_logs = analyze_document_in_batches(wrapped_json, provider, CATEGORIES, batch_size=10000, overlap_lines=3)
     else:
         result = analyze_with_api(wrapped_json, provider, CATEGORIES)
         batch_logs = "Single API call used (no batch processing)."
     
+    download_analysis_link = None
+    download_xls_link = None
     if result:
+        checksum_report = validate_checksums(result)
+        output_data = {
+            "financial_data": result,
+            "checksum_report": checksum_report
+        }
         analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
         try:
             with open(analysis_json_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, indent=2, ensure_ascii=False, default=lambda x: "NaN" if math.isnan(x) else x)
+                json.dump(output_data, f, indent=2, ensure_ascii=False, default=lambda x: "NaN" if math.isnan(x) else x)
         except Exception as e:
             logging.error(f"Error writing analysis JSON file: {e}")
+        
         try:
-            df = pd.DataFrame.from_dict(result, orient="index").T
-            analysis_xls_path = os.path.join("output", f"{filename}_analysis.xlsx")
-            df.to_excel(analysis_xls_path)
+            with pd.ExcelWriter(os.path.join("output", f"{filename}_analysis.xlsx")) as writer:
+                df_financial = pd.DataFrame.from_dict(result, orient="index")
+                df_financial.index.name = "Year"
+                df_financial = df_financial.transpose()
+                df_financial.to_excel(writer, sheet_name="Financial Data")
+                
+                df_checksum = pd.DataFrame.from_dict(checksum_report, orient="index")
+                df_checksum.index.name = "Year"
+                df_checksum = df_checksum.transpose()
+                df_checksum.to_excel(writer, sheet_name="Checksum Report")
         except Exception as e:
             logging.error(f"Error writing analysis XLS file: {e}")
         
@@ -521,21 +857,100 @@ def upload():
         download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
         download_xls_link = url_for("download_file", filename=f"{filename}_analysis.xlsx")
     else:
-        download_analysis_link = None
         download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
-        download_xls_link = None
         batch_logs += "\nNo analysis result obtained."
+
+    company_info = extract_company_info(raw_text, filename)
+
+    session = SessionLocal()
+    try:
+        record = BalanceSheetAnalysis(
+            filename=filename,
+            company_name=company_info.get("company_name"),
+            cnpj=company_info.get("cnpj"),
+            analysis_data=result if result else {},
+            ocr_data=json.loads(wrapped_json)
+        )
+        session.add(record)
+        session.commit()
+        logging.info(f"Record saved in DB for company: {company_info.get('company_name')}, CNPJ: {company_info.get('cnpj')}")
+    except Exception as e:
+        session.rollback()
+        logging.error(f"Error saving record to DB: {e}")
+    finally:
+        session.close()
     
     return render_template_string(RESULT_HTML,
                                   filename=filename,
                                   download_analysis_link=download_analysis_link,
                                   download_ocr_link=download_ocr_link,
                                   download_xls_link=download_xls_link,
-                                  batch_logs=batch_logs)
+                                  batch_logs=batch_logs,
+                                  version=APP_VERSION)
 
 @app.route("/download/<path:filename>")
 def download_file(filename: str):
     return send_from_directory("output", filename, as_attachment=True)
+
+# New route: Search form page
+@app.route("/search_page", methods=["GET"])
+def search_page():
+    return render_template_string(SEARCH_PAGE, version=APP_VERSION)
+
+# New route: Display search results in HTML
+@app.route("/search_results", methods=["GET"])
+def search_results():
+    company_query = request.args.get("company")
+    cnpj_query = request.args.get("cnpj")
+    session = SessionLocal()
+    try:
+        query = session.query(BalanceSheetAnalysis)
+        if company_query:
+            query = query.filter(BalanceSheetAnalysis.company_name.ilike(f"%{company_query}%"))
+        if cnpj_query:
+            query = query.filter(BalanceSheetAnalysis.cnpj.ilike(f"%{cnpj_query}%"))
+        results = query.all()
+        result_data = []
+        for res in results:
+            result_data.append({
+                "id": res.id,
+                "company_name": res.company_name,
+                "cnpj": res.cnpj,
+                "created_at": res.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            })
+        return render_template_string(SEARCH_RESULTS, results=result_data, version=APP_VERSION)
+    except Exception as e:
+        logging.error(f"Error during search: {e}")
+        return f"Error during search: {e}", 500
+    finally:
+        session.close()
+
+# New route: Record detail page
+@app.route("/record/<int:record_id>", methods=["GET"])
+def record_detail(record_id):
+    session = SessionLocal()
+    try:
+        record = session.query(BalanceSheetAnalysis).filter(BalanceSheetAnalysis.id == record_id).first()
+        if not record:
+            return "Record not found", 404
+        analysis = record.analysis_data if record.analysis_data else {}
+        sorted_years = sorted(analysis.keys()) if analysis else []
+        checksum = validate_checksums(analysis) if analysis else {}
+        return render_template_string(RECORD_DETAIL,
+                                      record=record,
+                                      analysis=analysis,
+                                      sorted_years=sorted_years,
+                                      checksum=checksum,
+                                      categories=CATEGORIES,
+                                      download_analysis_link=url_for("download_file", filename=f"{record.filename}_analysis.json"),
+                                      download_xls_link=url_for("download_file", filename=f"{record.filename}_analysis.xlsx"),
+                                      download_ocr_link=url_for("download_file", filename=f"{record.filename}_ocr.json"),
+                                      version=APP_VERSION)
+    except Exception as e:
+        logging.error(f"Error fetching record detail: {e}")
+        return f"Error fetching record detail: {e}", 500
+    finally:
+        session.close()
 
 if __name__ == "__main__":
     app.run(debug=True)
