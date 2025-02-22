@@ -22,18 +22,10 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 import cv2
 import numpy as np
 
-# For table extraction (fallback)
-import pdfplumber
+# Import LayoutParser for table detection
+import layoutparser as lp
 
-# LayoutParser (Detectron2-based table extraction)
-try:
-    from layoutparser.models.detectron2 import Detectron2LayoutModel
-    from detectron2.checkpoint import DetectionCheckpointer
-except ImportError:
-    Detectron2LayoutModel = None
-    logging.error("Detectron2LayoutModel not available. LayoutParser extraction will be skipped.")
-
-# SQLAlchemy setup for PostgreSQL integration
+# SQLAlchemy 2.0 imports
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -42,20 +34,21 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # -------------------------------
 load_dotenv()
 
-APP_VERSION = "v1.0.1"  # Displayed in browser footer
+APP_VERSION = "v1.0.1"  # Displayed in the browser footer
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# Environment variables for external tools and database
 POPPLER_PATH = os.getenv("POPPLER_PATH", "/opt/homebrew/bin")
 SCALE_FACTOR = int(os.getenv("SCALE_FACTOR", 1))
 CATEGORIES_FILE = "categories.json"
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://armin:mysecret@localhost/balancesheetdb")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://armin@localhost/balancesheetdb")
 
 # -------------------------------
-# SQLAlchemy Setup
+# SQLAlchemy setup for 2.0
 # -------------------------------
 engine = create_engine(DATABASE_URL, future=True)
 SessionLocal = sessionmaker(engine, autoflush=False, autocommit=False, future=True)
@@ -64,7 +57,7 @@ Base = declarative_base()
 class BalanceSheetAnalysis(Base):
     __tablename__ = "balance_sheet_analysis"
     id = Column(Integer, primary_key=True, index=True)
-    filename = Column(String, index=True)
+    filename = Column(String, index=True)  # Original filename
     company_name = Column(String, index=True)
     cnpj = Column(String, index=True)
     analysis_data = Column(JSON)
@@ -75,7 +68,7 @@ with engine.begin() as conn:
     Base.metadata.create_all(conn)
 
 # -------------------------------
-# Load Categories and Precompile Regex Patterns
+# Load Categories and precompile regex patterns
 # -------------------------------
 def load_categories() -> list:
     try:
@@ -90,7 +83,45 @@ CATEGORIES = load_categories()
 CATEGORY_PATTERNS = [(cat, re.compile(re.escape(cat), re.IGNORECASE)) for cat in CATEGORIES]
 
 # -------------------------------
-# Helper Functions for OCR and Image Processing
+# Helper Functions for OCR Processing
+# -------------------------------
+def reorder_line(line: str, categories: list) -> str:
+    found = None
+    for cat, pattern in CATEGORY_PATTERNS:
+        if pattern.search(line):
+            found = cat
+            line = pattern.sub('', line, count=1)
+            break
+    if found:
+        line = found + " " + line
+    return re.sub(r'\s+', ' ', line).strip()
+
+def clean_ocr_text(raw_text: str, categories: list) -> str:
+    cleaned_lines = []
+    for line in raw_text.splitlines():
+        line = re.sub(r"http\S+", "", line)
+        if len(line) > 10 and (re.search(r'\d', line.lstrip()) or any(cat.lower() in line.lower() for cat in categories)):
+            cleaned_lines.append(reorder_line(line, categories))
+    return "\n".join(cleaned_lines)
+
+def wrap_text_in_json(text: str) -> str:
+    """
+    Wrap the given text in a JSON structure under "document" with a "lines" array.
+    Each non-empty line is stored as an object with its line number.
+    """
+    lines = []
+    for idx, line in enumerate(text.splitlines()):
+        if line.strip():
+            lines.append({"line_number": idx + 1, "text": line.strip()})
+    wrapped = {"document": {"lines": lines}}
+    return json.dumps(wrapped, ensure_ascii=False, indent=2)
+
+def post_process_text(text: str) -> str:
+    text = re.sub(r'(?<=\d)O(?=\d)', '0', text)
+    return text
+
+# -------------------------------
+# Advanced Image Pre‑processing Functions
 # -------------------------------
 def deskew_image(img: Image.Image) -> Image.Image:
     try:
@@ -122,52 +153,62 @@ def advanced_preprocess_image(img: Image.Image) -> Image.Image:
     closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
     return Image.fromarray(closed)
 
-def post_process_text(text: str) -> str:
-    return re.sub(r'(?<=\d)O(?=\d)', '0', text)
-
-def reorder_line(line: str, categories: list) -> str:
-    found = None
-    for cat, pattern in CATEGORY_PATTERNS:
-        if pattern.search(line):
-            found = cat
-            line = pattern.sub('', line, count=1)
+# -------------------------------
+# Functions to Use LayoutParser for Table Detection
+# -------------------------------
+def parse_table_text(table_text: str) -> dict:
+    """Simple parser to extract a table from text. Expects header line with four-digit years."""
+    lines = table_text.splitlines()
+    header_line = None
+    years = []
+    for i, line in enumerate(lines):
+        potential_years = re.findall(r'\b\d{4}\b', line)
+        if potential_years:
+            header_line = i
+            years = potential_years
             break
-    if found:
-        line = found + " " + line
-    return re.sub(r'\s+', ' ', line).strip()
+    if not years:
+        years = ["Ano Desconhecido"]
+    table = {year: {} for year in years}
+    for i, line in enumerate(lines):
+        if header_line is not None and i <= header_line:
+            continue
+        tokens = line.split()
+        if len(tokens) < 2:
+            continue
+        category = tokens[0]
+        for j, year in enumerate(years):
+            try:
+                value = float(tokens[j+1].replace(',', '.')) if j+1 < len(tokens) else math.nan
+            except Exception:
+                value = math.nan
+            table[year][category] = value
+    return table
 
-def clean_ocr_text(raw_text: str, categories: list) -> str:
-    cleaned_lines = []
-    for line in raw_text.splitlines():
-        line = re.sub(r"http\S+", "", line)
-        if len(line) > 10 and (re.search(r'\d', line.lstrip()) or any(cat.lower() in line.lower() for cat in categories)):
-            cleaned_lines.append(reorder_line(line, categories))
-    return "\n".join(cleaned_lines)
-
-def wrap_text_in_json(text: str) -> str:
-    lines = []
-    for idx, line in enumerate(text.splitlines()):
-        if line.strip():
-            lines.append({"line_number": idx + 1, "text": line.strip()})
-    wrapped = {"document": {"lines": lines}}
-    return json.dumps(wrapped, ensure_ascii=False, indent=2)
-
-# -------------------------------
-# Data Sanitization: Replace NaN with None
-# -------------------------------
-def sanitize_data(obj):
-    if isinstance(obj, dict):
-        return {k: sanitize_data(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [sanitize_data(x) for x in obj]
-    elif isinstance(obj, float):
-        return None if math.isnan(obj) else obj
-    elif isinstance(obj, np.floating):
-        return None if np.isnan(obj) else obj
-    elif isinstance(obj, str) and obj.strip().lower() == "nan":
-        return None
-    else:
-        return obj
+def extract_table_using_layoutparser(img: Image.Image) -> dict:
+    """Detect table regions using LayoutParser, crop the largest table, run OCR on it, and parse table text."""
+    image_np = np.array(img)
+    # Use a pre-trained model from PubLayNet for layout detection
+    model = lp.Detectron2LayoutModel(
+        'lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config',
+        extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
+        label_map={0:"Text", 1:"Title", 2:"List", 3:"Table", 4:"Figure"}
+    )
+    layout = model.detect(image_np)
+    table_blocks = [block for block in layout if block.type == "Table"]
+    if not table_blocks:
+        logging.info("No table detected using LayoutParser.")
+        return {}
+    # Take the largest table block
+    table_blocks.sort(key=lambda b: b.area, reverse=True)
+    table_block = table_blocks[0]
+    cropped_np = table_block.crop(image_np)
+    cropped_img = Image.fromarray(cropped_np)
+    # Run OCR on the cropped table region
+    table_text = pytesseract.image_to_string(cropped_img, lang='por', config="--psm 6")
+    logging.info("LayoutParser OCR on table region completed.")
+    table_data = parse_table_text(table_text)
+    return table_data
 
 # -------------------------------
 # PDF and OCR Processing Functions
@@ -200,6 +241,7 @@ def extract_text(pdf_path: str) -> str:
         return ""
 
 def extract_table_from_image(img: Image.Image) -> dict:
+    # Fallback table extraction method using pytesseract image_to_data
     data = pytesseract.image_to_data(img, lang='por', config="--psm 6", output_type=pytesseract.Output.DICT)
     n_boxes = len(data['text'])
     lines = {}
@@ -240,112 +282,24 @@ def extract_table_from_image(img: Image.Image) -> dict:
             table[year][category] = value
     return table
 
-def extract_table_with_pdfplumber(pdf_path: str) -> dict:
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            page = pdf.pages[0]
-            table = page.extract_table()
-            if table:
-                header = table[0]
-                if len(header) < 2:
-                    return {}
-                years = header[1:]
-                result = {year: {} for year in years}
-                for row in table[1:]:
-                    if len(row) < len(header):
-                        continue
-                    category = row[0]
-                    for i, year in enumerate(years):
-                        try:
-                            value = float(row[i+1].replace('.', '').replace(',', '.'))
-                        except Exception:
-                            value = math.nan
-                        result[year][category] = value
-                return result
-            else:
-                return {}
-    except Exception as e:
-        logging.error(f"pdfplumber extraction failed: {e}")
-        return {}
-
-def extract_table_using_layoutparser(img: Image.Image) -> dict:
-    if Detectron2LayoutModel is None:
-        logging.error("Detectron2LayoutModel not available. Skipping LayoutParser extraction.")
-        return {}
-    try:
-        image_np = np.array(img)
-        model = Detectron2LayoutModel(
-            'lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config',
-            extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
-            label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"}
-        )
-        # Remove query parameters from checkpoint filename
-        checkpoint_url = "/root/.torch/iopath_cache/s/dgy9c10wykk4lq4/model_final.pth?dl=1"
-        checkpoint_path = checkpoint_url.split('?')[0]
-        if os.path.exists(checkpoint_url):
-            try:
-                if os.path.exists(checkpoint_path):
-                    os.remove(checkpoint_path)
-                os.rename(checkpoint_url, checkpoint_path)
-                logging.info(f"Renamed checkpoint from {checkpoint_url} to {checkpoint_path}")
-            except Exception as e:
-                logging.error(f"Failed to rename checkpoint file: {e}")
-        else:
-            logging.error(f"Checkpoint file not found at {checkpoint_url}")
-        from detectron2.checkpoint import DetectionCheckpointer
-        checkpointer = DetectionCheckpointer(model)
-        checkpointer.load(checkpoint_path)
-        layout = model.detect(image_np)
-        table_blocks = [block for block in layout if block.type == "Table"]
-        if not table_blocks:
-            logging.info("No table detected with LayoutParser.")
-            return {}
-        table_blocks.sort(key=lambda b: b.area, reverse=True)
-        table_block = table_blocks[0]
-        cropped_np = table_block.crop(image_np)
-        cropped_img = Image.fromarray(cropped_np)
-        table_text = pytesseract.image_to_string(cropped_img, lang='por', config="--psm 12 --oem 3")
-        logging.info("LayoutParser OCR on detected table region completed.")
-        return parse_table_text(table_text)
-    except Exception as e:
-        logging.error(f"LayoutParser extraction failed: {e}")
-        return {}
-
-def parse_table_text(table_text: str) -> dict:
-    lines = table_text.splitlines()
-    table = {}
-    for line in lines:
-        tokens = line.split()
-        if len(tokens) >= 2:
-            key = tokens[0]
-            try:
-                value = float(tokens[1].replace(',', '.'))
-            except Exception:
-                value = None
-            table[key] = value
-    return table
-
-def extract_text_and_table(pdf_path: str) -> (str, dict, str):
+def perform_analysis_local(pdf_path: str) -> (str, dict, str):
     raw_text = extract_text(pdf_path)
     wrapped_json = json.dumps({"document": {"lines": raw_text.splitlines()}}, ensure_ascii=False, indent=2)
-    table_data = extract_table_with_pdfplumber(pdf_path)
-    if not table_data or not any(table_data.values()):
-        try:
-            images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH, dpi=300)
-            first_page_img = advanced_preprocess_image(images[0])
-            table_data = extract_table_using_layoutparser(first_page_img)
-            if not table_data or not any(table_data.values()):
-                logging.info("Falling back to default table extraction with pytesseract.")
-                table_data = extract_table_from_image(first_page_img)
-            else:
-                logging.info("LayoutParser extraction succeeded.")
-        except Exception as e:
-            logging.error("Table extraction failed: %s", e)
-            table_data = {}
+    try:
+        images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH, dpi=300)
+        first_page_img = advanced_preprocess_image(images[0])
+        # First, try using LayoutParser for table detection.
+        table_data = extract_table_using_layoutparser(first_page_img)
+        if not table_data:
+            logging.info("Falling back to default table extraction.")
+            table_data = extract_table_from_image(first_page_img)
+    except Exception as e:
+        logging.error("Table extraction failed: %s", e)
+        table_data = {}
     return wrapped_json, table_data, raw_text
 
 # -------------------------------
-# Company Information Extraction
+# Company Info Extraction
 # -------------------------------
 def extract_company_info(ocr_text: str, filename: str) -> dict:
     cnpj_pattern = r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}'
@@ -359,11 +313,14 @@ def extract_company_info(ocr_text: str, filename: str) -> dict:
     else:
         base = os.path.splitext(filename)[0]
         fallback_match = re.search(r'^([^\d]+)', base)
-        company_name = fallback_match.group(1).strip() if fallback_match else base.strip()
+        if fallback_match:
+            company_name = fallback_match.group(1).strip()
+        else:
+            company_name = base.strip()
     return {"company_name": company_name, "cnpj": cnpj}
 
 # -------------------------------
-# Checksum Validation
+# Checksum Validation Function
 # -------------------------------
 def validate_checksums(data: dict) -> dict:
     checksum_report = {}
@@ -382,8 +339,10 @@ def validate_checksums(data: dict) -> dict:
                         sum_ativo += value
                         ativo_found = True
             if ativo_found:
-                report["ativo"] = (f"Checksum error: sum is {sum_ativo}, expected {ativo_total}"
-                                   if abs(sum_ativo - ativo_total) > tolerance else "OK")
+                if abs(sum_ativo - ativo_total) > tolerance:
+                    report["ativo"] = f"Checksum error: sum of Ativo items is {sum_ativo}, expected {ativo_total}."
+                else:
+                    report["ativo"] = "OK"
             else:
                 report["ativo"] = "No Ativo line items found for checksum validation"
         passivo_total = values.get("Passivo Total")
@@ -398,15 +357,17 @@ def validate_checksums(data: dict) -> dict:
                         sum_passivo += value
                         passivo_found = True
             if passivo_found:
-                report["passivo"] = (f"Checksum error: sum is {sum_passivo}, expected {passivo_total}"
-                                     if abs(sum_passivo - passivo_total) > tolerance else "OK")
+                if abs(sum_passivo - passivo_total) > tolerance:
+                    report["passivo"] = f"Checksum error: sum of Passivo items is {sum_passivo}, expected {passivo_total}."
+                else:
+                    report["passivo"] = "OK"
             else:
                 report["passivo"] = "No Passivo line items found for checksum validation"
         checksum_report[year] = report
     return checksum_report
 
 # -------------------------------
-# API Integration Functions (if needed)
+# API Integration Functions (if used)
 # -------------------------------
 def extract_json_from_text(text: str) -> str:
     candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
@@ -427,6 +388,30 @@ def extract_json_from_text(text: str) -> str:
             logging.error("Failed to decode JSON from candidate.")
             return None
     return None
+
+def format_financial_data(response_json: dict, categories: list) -> dict:
+    try:
+        content = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not content.strip():
+            logging.error("Formatting error: API returned empty content.")
+            return None
+        json_text = extract_json_from_text(content)
+        if not json_text:
+            logging.error("Formatting error: Could not extract JSON content from the response.")
+            return None
+        raw_data = json.loads(json_text)
+        if any(key in categories for key in raw_data.keys()):
+            raw_data = {"Ano Desconhecido": raw_data}
+        formatted = {}
+        for year, data in raw_data.items():
+            formatted[year] = {}
+            for category in categories:
+                raw_value = data.get(category, math.nan)
+                formatted[year][category] = parse_value(raw_value)
+        return formatted
+    except Exception as e:
+        logging.error(f"Formatting error: {e}")
+        return None
 
 def parse_value(value) -> float:
     if value in [None, "NaN", ""]:
@@ -454,30 +439,6 @@ def parse_value(value) -> float:
         return float(value) * SCALE_FACTOR
     except Exception:
         return math.nan
-
-def format_financial_data(response_json: dict, categories: list) -> dict:
-    try:
-        content = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-        if not content.strip():
-            logging.error("Formatting error: API returned empty content.")
-            return None
-        json_text = extract_json_from_text(content)
-        if not json_text:
-            logging.error("Formatting error: Could not extract JSON content from the response.")
-            return None
-        raw_data = json.loads(json_text)
-        if any(key in categories for key in raw_data.keys()):
-            raw_data = {"Ano Desconhecido": raw_data}
-        formatted = {}
-        for year, data in raw_data.items():
-            formatted[year] = {}
-            for category in categories:
-                raw_value = data.get(category, math.nan)
-                formatted[year][category] = parse_value(raw_value)
-        return formatted
-    except Exception as e:
-        logging.error(f"Formatting error: {e}")
-        return None
 
 def get_api_parameters(provider: str) -> tuple:
     if provider == "deepseek":
@@ -786,6 +747,7 @@ RECORD_DETAIL = """
     .navbar a { float: left; display: block; color: #f2f2f2; text-align: center; padding: 14px 16px; text-decoration: none; }
     .navbar a:hover { background-color: #ddd; color: black; }
     .container { width: 90%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    /* Tab styling */
     .tab { overflow: hidden; border-bottom: 1px solid #ccc; }
     .tab button { background-color: inherit; float: left; border: none; outline: none; cursor: pointer; padding: 14px 16px; transition: 0.3s; font-size: 17px; }
     .tab button:hover { background-color: #ddd; }
@@ -826,11 +788,13 @@ RECORD_DETAIL = """
   <p><strong>CNPJ:</strong> {{ record.cnpj }}</p>
   <p><strong>Last Updated:</strong> {{ record.created_at }}</p>
   
+  <!-- Tab navigation -->
   <div class="tab">
     <button class="tablinks" onclick="openTab(event, 'balance')">Balance Sheet</button>
     <button class="tablinks" onclick="openTab(event, 'checksum')">Checksum</button>
   </div>
   
+  <!-- Balance Sheet Tab -->
   <div id="balance" class="tabcontent">
     <h3>Extracted Balance Sheet Information</h3>
     {% if analysis and sorted_years %}
@@ -855,6 +819,7 @@ RECORD_DETAIL = """
     {% endif %}
   </div>
   
+  <!-- Checksum Tab -->
   <div id="checksum" class="tabcontent">
     <h3>Checksum Information</h3>
     {% if checksum and sorted_years %}
@@ -923,27 +888,25 @@ def upload():
     filename = secure_filename(file.filename)
     upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(upload_path)
+    
     logging.info("File %s saved to %s", filename, upload_path)
 
-    raw_text, table_data, _ = extract_text_and_table(upload_path)
+    raw_text = extract_text(upload_path)
     cleaned_text = clean_ocr_text(raw_text, CATEGORIES)
     wrapped_json = wrap_text_in_json(cleaned_text)
+    
     json_text_path = os.path.join("output", f"{filename}_ocr.json")
     try:
         with open(json_text_path, "w", encoding="utf-8") as f:
-            json.dump(
-                json.loads(wrapped_json),
-                f,
-                indent=2,
-                ensure_ascii=False,
-                default=lambda x: None if isinstance(x, float) and math.isnan(x) else x
-            )
+            f.write(wrapped_json)
     except Exception as e:
         logging.error("Error writing OCR JSON file: %s", e)
-
-    # Sanitize the table extraction result before saving
-    result = sanitize_data(table_data)
-    batch_logs = "Hybrid table extraction completed."
+    
+    if len(cleaned_text) > 10000:
+        result, batch_logs = analyze_document_in_batches(wrapped_json, provider, CATEGORIES, batch_size=10000, overlap_lines=3)
+    else:
+        result = analyze_with_api(wrapped_json, provider, CATEGORIES)
+        batch_logs = "Single API call used (no batch processing)."
     
     download_analysis_link = None
     download_xls_link = None
@@ -953,11 +916,10 @@ def upload():
             "financial_data": result,
             "checksum_report": checksum_report
         }
-        output_data = sanitize_data(output_data)
         analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
         try:
             with open(analysis_json_path, "w", encoding="utf-8") as f:
-                json.dump(output_data, f, indent=2, ensure_ascii=False)
+                json.dump(output_data, f, indent=2, ensure_ascii=False, default=lambda x: "NaN" if math.isnan(x) else x)
         except Exception as e:
             logging.error("Error writing analysis JSON file: %s", e)
         
@@ -983,6 +945,7 @@ def upload():
         batch_logs += "\nNo analysis result obtained."
 
     company_info = extract_company_info(raw_text, filename)
+
     session = SessionLocal()
     try:
         record = BalanceSheetAnalysis(
