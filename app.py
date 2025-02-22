@@ -31,6 +31,30 @@ from layoutparser.models.detectron2 import Detectron2LayoutModel
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+import os
+import logging
+
+def clean_checkpoint_path(original_path: str) -> str:
+    """
+    If the checkpoint filename contains a query parameter (e.g., '?dl=1'),
+    copy the file to a new filename without the query so that the checkpointer can load it.
+    """
+    if '?' in original_path:
+        new_path = original_path.split('?')[0]
+        try:
+            # If a file already exists with the new name, remove it
+            if os.path.exists(new_path):
+                os.remove(new_path)
+            # Copy the file to the new path
+            with open(original_path, 'rb') as src, open(new_path, 'wb') as dst:
+                dst.write(src.read())
+            logging.info(f"Copied checkpoint from {original_path} to {new_path}")
+            return new_path
+        except Exception as e:
+            logging.error(f"Failed to clean checkpoint path: {e}")
+            return original_path
+    return original_path
+
 # -------------------------------
 # Load configuration and set up logging
 # -------------------------------
@@ -320,6 +344,7 @@ def extract_table_using_layoutparser(img: Image.Image) -> dict:
         )
         # Specify the expected checkpoint file path
         checkpoint_url = "/root/.torch/iopath_cache/s/dgy9c10wykk4lq4/model_final.pth?dl=1"
+        # Clean the checkpoint path (remove the query string)
         checkpoint_path = clean_checkpoint_path(checkpoint_url)
         from detectron2.checkpoint import DetectionCheckpointer
         checkpointer = DetectionCheckpointer(model)
