@@ -988,7 +988,13 @@ def upload():
         analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
         try:
             with open(analysis_json_path, "w", encoding="utf-8") as f:
-                json.dump(output_data, f, indent=2, ensure_ascii=False, default=lambda x: "NaN" if math.isnan(x) else x)
+    json.dump(
+        output_data, 
+        f, 
+        indent=2, 
+        ensure_ascii=False, 
+        default=lambda x: None if isinstance(x, float) and math.isnan(x) else x
+    )
         except Exception as e:
             logging.error("Error writing analysis JSON file: %s", e)
         
