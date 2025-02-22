@@ -977,26 +977,26 @@ def upload():
     result = table_data
     batch_logs = "Hybrid table extraction completed."
     
-    download_analysis_link = None
-    download_xls_link = None
-    if result:
-        checksum_report = validate_checksums(result)
-        output_data = {
-            "financial_data": result,
-            "checksum_report": checksum_report
-        }
-        analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
-        try:
-            with open(analysis_json_path, "w", encoding="utf-8") as f:
-    json.dump(
-        output_data, 
-        f, 
-        indent=2, 
-        ensure_ascii=False, 
-        default=lambda x: None if isinstance(x, float) and math.isnan(x) else x
-    )
-        except Exception as e:
-            logging.error("Error writing analysis JSON file: %s", e)
+download_analysis_link = None
+download_xls_link = None
+if result:
+    checksum_report = validate_checksums(result)
+    output_data = {
+        "financial_data": result,
+        "checksum_report": checksum_report
+    }
+    analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
+    try:
+        with open(analysis_json_path, "w", encoding="utf-8") as f:
+            json.dump(
+                output_data,
+                f,
+                indent=2,
+                ensure_ascii=False,
+                default=lambda x: None if isinstance(x, float) and math.isnan(x) else x
+            )
+    except Exception as e:
+        logging.error(f"Error writing analysis JSON file: {e}")
         
         try:
             with pd.ExcelWriter(os.path.join("output", f"{filename}_analysis.xlsx")) as writer:
