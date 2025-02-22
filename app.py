@@ -281,25 +281,64 @@ def parse_table_text(table_text: str) -> dict:
             table[year][category] = value
     return table
 
+import os
+import logging
+
+def clean_checkpoint_path(original_path: str) -> str:
+    """
+    If the checkpoint filename contains a query string (e.g., '?dl=1'),
+    rename the file to remove the query so that the checkpointer can load it.
+    """
+    if '?' in original_path:
+        new_path = original_path.split('?')[0]
+        try:
+            # If a file already exists with the new name, remove it first
+            if os.path.exists(new_path):
+                os.remove(new_path)
+            os.rename(original_path, new_path)
+            logging.info(f"Renamed checkpoint from {original_path} to {new_path}")
+            return new_path
+        except Exception as e:
+            logging.error(f"Failed to rename checkpoint file: {e}")
+            return original_path
+    return original_path
+
 def extract_table_using_layoutparser(img: Image.Image) -> dict:
-    image_np = np.array(img)
-    model = Detectron2LayoutModel(
-        'lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config',
-        extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
-        label_map={0:"Text", 1:"Title", 2:"List", 3:"Table", 4:"Figure"}
-    )
-    layout = model.detect(image_np)
-    table_blocks = [block for block in layout if block.type == "Table"]
-    if not table_blocks:
-        logging.info("No table detected with LayoutParser.")
+    """
+    Use LayoutParser (Detectron2-based model) to detect a table region in the image,
+    then run OCR on that region and parse the table text.
+    """
+    if Detectron2LayoutModel is None:
+        logging.error("Detectron2LayoutModel is not available. Skipping LayoutParser extraction.")
         return {}
-    table_blocks.sort(key=lambda b: b.area, reverse=True)
-    table_block = table_blocks[0]
-    cropped_np = table_block.crop(image_np)
-    cropped_img = Image.fromarray(cropped_np)
-    table_text = pytesseract.image_to_string(cropped_img, lang='por', config="--psm 12 --oem 3")
-    logging.info("LayoutParser OCR on detected table region completed.")
-    return parse_table_text(table_text)
+    try:
+        image_np = np.array(img)
+        model = Detectron2LayoutModel(
+            'lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config',
+            extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
+            label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"}
+        )
+        # Specify the expected checkpoint file path
+        checkpoint_url = "/root/.torch/iopath_cache/s/dgy9c10wykk4lq4/model_final.pth?dl=1"
+        checkpoint_path = clean_checkpoint_path(checkpoint_url)
+        from detectron2.checkpoint import DetectionCheckpointer
+        checkpointer = DetectionCheckpointer(model)
+        checkpointer.load(checkpoint_path)
+        layout = model.detect(image_np)
+        table_blocks = [block for block in layout if block.type == "Table"]
+        if not table_blocks:
+            logging.info("No table detected with LayoutParser.")
+            return {}
+        table_blocks.sort(key=lambda b: b.area, reverse=True)
+        table_block = table_blocks[0]
+        cropped_np = table_block.crop(image_np)
+        cropped_img = Image.fromarray(cropped_np)
+        table_text = pytesseract.image_to_string(cropped_img, lang='por', config="--psm 12 --oem 3")
+        logging.info("LayoutParser OCR on detected table region completed.")
+        return parse_table_text(table_text)
+    except Exception as e:
+        logging.error(f"LayoutParser extraction failed: {e}")
+        return {}
 
 # -------------------------------
 # Hybrid PDF Text and Table Extraction
