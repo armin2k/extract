@@ -22,7 +22,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 import cv2
 import numpy as np
 
-# For table extraction from PDFs (fallback)
+# For table extraction (fallback)
 import pdfplumber
 
 # LayoutParser (Detectron2-based table extraction)
@@ -155,7 +155,6 @@ def wrap_text_in_json(text: str) -> str:
 # -------------------------------
 # Data Sanitization: Replace NaN with None
 # -------------------------------
-import numpy as np
 def sanitize_data(obj):
     if isinstance(obj, dict):
         return {k: sanitize_data(v) for k, v in obj.items()}
@@ -270,10 +269,6 @@ def extract_table_with_pdfplumber(pdf_path: str) -> dict:
         return {}
 
 def extract_table_using_layoutparser(img: Image.Image) -> dict:
-    """
-    Use LayoutParser (Detectron2-based model) to detect a table region,
-    then run OCR on that region and parse the table text.
-    """
     if Detectron2LayoutModel is None:
         logging.error("Detectron2LayoutModel not available. Skipping LayoutParser extraction.")
         return {}
@@ -387,7 +382,7 @@ def validate_checksums(data: dict) -> dict:
                         sum_ativo += value
                         ativo_found = True
             if ativo_found:
-                report["ativo"] = (f"Checksum error: sum is {sum_ativo}, expected {ativo_total}."
+                report["ativo"] = (f"Checksum error: sum is {sum_ativo}, expected {ativo_total}"
                                    if abs(sum_ativo - ativo_total) > tolerance else "OK")
             else:
                 report["ativo"] = "No Ativo line items found for checksum validation"
@@ -403,7 +398,7 @@ def validate_checksums(data: dict) -> dict:
                         sum_passivo += value
                         passivo_found = True
             if passivo_found:
-                report["passivo"] = (f"Checksum error: sum is {sum_passivo}, expected {passivo_total}."
+                report["passivo"] = (f"Checksum error: sum is {sum_passivo}, expected {passivo_total}"
                                      if abs(sum_passivo - passivo_total) > tolerance else "OK")
             else:
                 report["passivo"] = "No Passivo line items found for checksum validation"
@@ -937,148 +932,4 @@ def upload():
     try:
         with open(json_text_path, "w", encoding="utf-8") as f:
             json.dump(
-                json.loads(wrapped_json),
-                f,
-                indent=2,
-                ensure_ascii=False,
-                default=lambda x: None if isinstance(x, float) and math.isnan(x) else x
-            )
-    except Exception as e:
-        logging.error("Error writing OCR JSON file: %s", e)
-
-    result = table_data  # Use the table extraction result
-    batch_logs = "Hybrid table extraction completed."
-    
-    download_analysis_link = None
-    download_xls_link = None
-    if result:
-        checksum_report = validate_checksums(result)
-        output_data = {
-            "financial_data": result,
-            "checksum_report": checksum_report
-        }
-        # Sanitize output_data to replace NaN with None (null in JSON)
-        output_data = sanitize_data(output_data)
-        analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
-        try:
-            with open(analysis_json_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    output_data,
-                    f,
-                    indent=2,
-                    ensure_ascii=False
-                )
-        except Exception as e:
-            logging.error("Error writing analysis JSON file: %s", e)
-        
-        try:
-            with pd.ExcelWriter(os.path.join("output", f"{filename}_analysis.xlsx")) as writer:
-                df_financial = pd.DataFrame.from_dict(result, orient="index")
-                df_financial.index.name = "Year"
-                df_financial = df_financial.transpose()
-                df_financial.to_excel(writer, sheet_name="Financial Data")
-                
-                df_checksum = pd.DataFrame.from_dict(checksum_report, orient="index")
-                df_checksum.index.name = "Year"
-                df_checksum = df_checksum.transpose()
-                df_checksum.to_excel(writer, sheet_name="Checksum Report")
-        except Exception as e:
-            logging.error("Error writing analysis XLS file: %s", e)
-        
-        download_analysis_link = url_for("download_file", filename=f"{filename}_analysis.json")
-        download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
-        download_xls_link = url_for("download_file", filename=f"{filename}_analysis.xlsx")
-    else:
-        download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
-        batch_logs += "\nNo analysis result obtained."
-
-    company_info = extract_company_info(raw_text, filename)
-    session = SessionLocal()
-    try:
-        record = BalanceSheetAnalysis(
-            filename=filename,
-            company_name=company_info.get("company_name"),
-            cnpj=company_info.get("cnpj"),
-            analysis_data=result if result else {},
-            ocr_data=json.loads(wrapped_json)
-        )
-        session.add(record)
-        session.commit()
-        logging.info("Record saved in DB for company: %s, CNPJ: %s", company_info.get("company_name"), company_info.get("cnpj"))
-    except Exception as e:
-        session.rollback()
-        logging.error("Error saving record to DB: %s", e)
-    finally:
-        session.close()
-    
-    return render_template_string(RESULT_HTML,
-                                  filename=filename,
-                                  download_analysis_link=download_analysis_link,
-                                  download_ocr_link=download_ocr_link,
-                                  download_xls_link=download_xls_link,
-                                  batch_logs=batch_logs,
-                                  version=APP_VERSION)
-
-@app.route("/download/<path:filename>")
-def download_file(filename: str):
-    return send_from_directory("output", filename, as_attachment=True)
-
-@app.route("/search_page", methods=["GET"])
-def search_page():
-    return render_template_string(SEARCH_PAGE, version=APP_VERSION)
-
-@app.route("/search_results", methods=["GET"])
-def search_results():
-    company_query = request.args.get("company")
-    cnpj_query = request.args.get("cnpj")
-    session = SessionLocal()
-    try:
-        query = session.query(BalanceSheetAnalysis)
-        if company_query:
-            query = query.filter(BalanceSheetAnalysis.company_name.ilike(f"%{company_query}%"))
-        if cnpj_query:
-            query = query.filter(BalanceSheetAnalysis.cnpj.ilike(f"%{cnpj_query}%"))
-        results = query.all()
-        result_data = []
-        for res in results:
-            result_data.append({
-                "id": res.id,
-                "company_name": res.company_name,
-                "cnpj": res.cnpj,
-                "created_at": res.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            })
-        return render_template_string(SEARCH_RESULTS, results=result_data, version=APP_VERSION)
-    except Exception as e:
-        logging.error("Error during search: %s", e)
-        return f"Error during search: {e}", 500
-    finally:
-        session.close()
-
-@app.route("/record/<int:record_id>", methods=["GET"])
-def record_detail(record_id):
-    session = SessionLocal()
-    try:
-        record = session.query(BalanceSheetAnalysis).filter(BalanceSheetAnalysis.id == record_id).first()
-        if not record:
-            return "Record not found", 404
-        analysis = record.analysis_data if record.analysis_data else {}
-        sorted_years = sorted(analysis.keys()) if analysis else []
-        checksum = validate_checksums(analysis) if analysis else {}
-        return render_template_string(RECORD_DETAIL,
-                                      record=record,
-                                      analysis=analysis,
-                                      sorted_years=sorted_years,
-                                      checksum=checksum,
-                                      categories=CATEGORIES,
-                                      download_analysis_link=url_for("download_file", filename=f"{record.filename}_analysis.json"),
-                                      download_xls_link=url_for("download_file", filename=f"{record.filename}_analysis.xlsx"),
-                                      download_ocr_link=url_for("download_file", filename=f"{record.filename}_ocr.json"),
-                                      version=APP_VERSION)
-    except Exception as e:
-        logging.error("Error fetching record detail: %s", e)
-        return f"Error fetching record detail: {e}", 500
-    finally:
-        session.close()
-
-if __name__ == "__main__":
-    app.run(debug=True)
+                json.loads
