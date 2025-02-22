@@ -239,7 +239,7 @@ def extract_table_with_tabula(pdf_path: str) -> dict:
         logging.error(f"Tabula extraction failed: {e}")
         return {}
 
-ef clean_checkpoint_path(original_path: str) -> str:
+def clean_checkpoint_path(original_path: str) -> str:
     if '?' in original_path:
         new_path = original_path.split('?')[0]
         if not os.path.exists(new_path):
