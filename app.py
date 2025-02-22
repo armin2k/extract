@@ -152,7 +152,10 @@ def wrap_text_in_json(text: str) -> str:
     wrapped = {"document": {"lines": lines}}
     return json.dumps(wrapped, ensure_ascii=False, indent=2)
 
-# Recursive function to replace NaN with None
+# -------------------------------
+# Data Sanitization: Replace NaN with None
+# -------------------------------
+import numpy as np
 def sanitize_data(obj):
     if isinstance(obj, dict):
         return {k: sanitize_data(v) for k, v in obj.items()}
@@ -160,6 +163,10 @@ def sanitize_data(obj):
         return [sanitize_data(x) for x in obj]
     elif isinstance(obj, float):
         return None if math.isnan(obj) else obj
+    elif isinstance(obj, np.floating):
+        return None if np.isnan(obj) else obj
+    elif isinstance(obj, str) and obj.strip().lower() == "nan":
+        return None
     else:
         return obj
 
@@ -277,9 +284,8 @@ def extract_table_using_layoutparser(img: Image.Image) -> dict:
             extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
             label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"}
         )
-        # Use the checkpoint URL from cache (contains ?dl=1)
+        # Remove query parameters from checkpoint filename
         checkpoint_url = "/root/.torch/iopath_cache/s/dgy9c10wykk4lq4/model_final.pth?dl=1"
-        # Remove query parameters by renaming the file
         checkpoint_path = checkpoint_url.split('?')[0]
         if os.path.exists(checkpoint_url):
             try:
@@ -940,7 +946,7 @@ def upload():
     except Exception as e:
         logging.error("Error writing OCR JSON file: %s", e)
 
-    result = table_data  # Use table extraction result
+    result = table_data  # Use the table extraction result
     batch_logs = "Hybrid table extraction completed."
     
     download_analysis_link = None
@@ -951,7 +957,7 @@ def upload():
             "financial_data": result,
             "checksum_report": checksum_report
         }
-        # Sanitize output_data to replace NaN with null
+        # Sanitize output_data to replace NaN with None (null in JSON)
         output_data = sanitize_data(output_data)
         analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
         try:
