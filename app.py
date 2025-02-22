@@ -21,14 +21,14 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+import logging
+logging.getLogger('org.apache.pdfbox').setLevel(logging.ERROR)
+
 # For table extraction
 import pdfplumber
 import camelot
 from tabula import read_pdf
 from layoutparser.models.detectron2 import Detectron2LayoutModel
-
-import logging
-logging.getLogger('org.apache.pdfbox').setLevel(logging.ERROR)
 
 # Load configuration and set up logging
 load_dotenv()
@@ -917,9 +917,11 @@ def upload():
     batch_logs = "Hybrid table extraction completed."
 
     if result:
-        checksum_report = validate_checksums(result)
+        # Convert NaN to None in result for both file output and database
+        safe_result = json.loads(json.dumps(result, default=lambda x: None if isinstance(x, float) and math.isnan(x) else x))
+        checksum_report = validate_checksums(safe_result)  # Use safe_result to ensure consistency
         output_data = {
-            "financial_data": result,
+            "financial_data": safe_result,
             "checksum_report": checksum_report
         }
         analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
@@ -930,7 +932,7 @@ def upload():
                     f,
                     indent=2,
                     ensure_ascii=False,
-                    default=lambda x: None if isinstance(x, float) and math.isnan(x) else x  # Replace NaN with null
+                    default=lambda x: None if isinstance(x, float) and math.isnan(x) else x
                 )
         except Exception as e:
             logging.error(f"Error writing analysis JSON file: {e}")
@@ -938,7 +940,7 @@ def upload():
 
         try:
             with pd.ExcelWriter(os.path.join("output", f"{filename}_analysis.xlsx")) as writer:
-                df_financial = pd.DataFrame.from_dict(result, orient="index")
+                df_financial = pd.DataFrame.from_dict(safe_result, orient="index")
                 df_financial.index.name = "Year"
                 df_financial = df_financial.transpose()
                 df_financial.to_excel(writer, sheet_name="Financial Data")
@@ -962,13 +964,12 @@ def upload():
     company_info = extract_company_info(raw_text, filename)
     session = SessionLocal()
     try:
-        # Replace NaN with None in result for database storage
-        db_analysis_data = json.loads(json.dumps(result, default=lambda x: None if isinstance(x, float) and math.isnan(x) else x))
+        # Use the safe_result (with NaN replaced by None) for database storage
         record = BalanceSheetAnalysis(
             filename=filename,
             company_name=company_info.get("company_name"),
             cnpj=company_info.get("cnpj"),
-            analysis_data=db_analysis_data,
+            analysis_data=safe_result,
             ocr_data=json.loads(wrapped_json)
         )
         session.add(record)
