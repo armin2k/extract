@@ -22,43 +22,26 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 import cv2
 import numpy as np
 
-# Specialized table extraction libraries and layout detection
+# Specialized table extraction
 import pdfplumber
-# Import Detectron2LayoutModel from the proper module in LayoutParser
-from layoutparser.models.detectron2 import Detectron2LayoutModel
 
-# SQLAlchemy 2.0 imports
+# LayoutParser (Detectron2-based table extraction)
+try:
+    from layoutparser.models.detectron2 import Detectron2LayoutModel
+    from detectron2.checkpoint import DetectionCheckpointer
+except ImportError:
+    Detectron2LayoutModel = None
+    logging.error("Detectron2LayoutModel not available. LayoutParser extraction will be skipped.")
+
+# SQLAlchemy setup
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
-
-import os
-import logging
-
-def clean_checkpoint_path(original_path: str) -> str:
-    """
-    If the checkpoint filename contains a query parameter (e.g., '?dl=1'),
-    copy the file to a new filename without the query so that the checkpointer can load it.
-    """
-    if '?' in original_path:
-        new_path = original_path.split('?')[0]
-        try:
-            # If a file already exists with the new name, remove it
-            if os.path.exists(new_path):
-                os.remove(new_path)
-            # Copy the file to the new path
-            with open(original_path, 'rb') as src, open(new_path, 'wb') as dst:
-                dst.write(src.read())
-            logging.info(f"Copied checkpoint from {original_path} to {new_path}")
-            return new_path
-        except Exception as e:
-            logging.error(f"Failed to clean checkpoint path: {e}")
-            return original_path
-    return original_path
 
 # -------------------------------
 # Load configuration and set up logging
 # -------------------------------
 load_dotenv()
+
 APP_VERSION = "v1.0.1"  # Displayed in the browser footer
 
 logging.basicConfig(
@@ -69,10 +52,10 @@ logging.basicConfig(
 POPPLER_PATH = os.getenv("POPPLER_PATH", "/opt/homebrew/bin")
 SCALE_FACTOR = int(os.getenv("SCALE_FACTOR", 1))
 CATEGORIES_FILE = "categories.json"
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://armin@localhost/balancesheetdb")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://armin:mysecret@localhost/balancesheetdb")
 
 # -------------------------------
-# SQLAlchemy Setup for 2.0
+# SQLAlchemy Setup
 # -------------------------------
 engine = create_engine(DATABASE_URL, future=True)
 SessionLocal = sessionmaker(engine, autoflush=False, autocommit=False, future=True)
@@ -81,7 +64,7 @@ Base = declarative_base()
 class BalanceSheetAnalysis(Base):
     __tablename__ = "balance_sheet_analysis"
     id = Column(Integer, primary_key=True, index=True)
-    filename = Column(String, index=True)  # Original filename
+    filename = Column(String, index=True)
     company_name = Column(String, index=True)
     cnpj = Column(String, index=True)
     analysis_data = Column(JSON)
@@ -107,40 +90,7 @@ CATEGORIES = load_categories()
 CATEGORY_PATTERNS = [(cat, re.compile(re.escape(cat), re.IGNORECASE)) for cat in CATEGORIES]
 
 # -------------------------------
-# Helper Functions for OCR Processing
-# -------------------------------
-def reorder_line(line: str, categories: list) -> str:
-    found = None
-    for cat, pattern in CATEGORY_PATTERNS:
-        if pattern.search(line):
-            found = cat
-            line = pattern.sub('', line, count=1)
-            break
-    if found:
-        line = found + " " + line
-    return re.sub(r'\s+', ' ', line).strip()
-
-def clean_ocr_text(raw_text: str, categories: list) -> str:
-    cleaned_lines = []
-    for line in raw_text.splitlines():
-        line = re.sub(r"http\S+", "", line)
-        if len(line) > 10 and (re.search(r'\d', line.lstrip()) or any(cat.lower() in line.lower() for cat in categories)):
-            cleaned_lines.append(reorder_line(line, categories))
-    return "\n".join(cleaned_lines)
-
-def wrap_text_in_json(text: str) -> str:
-    lines = []
-    for idx, line in enumerate(text.splitlines()):
-        if line.strip():
-            lines.append({"line_number": idx + 1, "text": line.strip()})
-    wrapped = {"document": {"lines": lines}}
-    return json.dumps(wrapped, ensure_ascii=False, indent=2)
-
-def post_process_text(text: str) -> str:
-    return re.sub(r'(?<=\d)O(?=\d)', '0', text)
-
-# -------------------------------
-# Advanced Image Pre‑processing Functions
+# Helper Functions for OCR and Image Processing
 # -------------------------------
 def deskew_image(img: Image.Image) -> Image.Image:
     try:
@@ -171,6 +121,36 @@ def advanced_preprocess_image(img: Image.Image) -> Image.Image:
     opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
     closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
     return Image.fromarray(closed)
+
+def post_process_text(text: str) -> str:
+    return re.sub(r'(?<=\d)O(?=\d)', '0', text)
+
+def reorder_line(line: str, categories: list) -> str:
+    found = None
+    for cat, pattern in CATEGORY_PATTERNS:
+        if pattern.search(line):
+            found = cat
+            line = pattern.sub('', line, count=1)
+            break
+    if found:
+        line = found + " " + line
+    return re.sub(r'\s+', ' ', line).strip()
+
+def clean_ocr_text(raw_text: str, categories: list) -> str:
+    cleaned_lines = []
+    for line in raw_text.splitlines():
+        line = re.sub(r"http\S+", "", line)
+        if len(line) > 10 and (re.search(r'\d', line.lstrip()) or any(cat.lower() in line.lower() for cat in categories)):
+            cleaned_lines.append(reorder_line(line, categories))
+    return "\n".join(cleaned_lines)
+
+def wrap_text_in_json(text: str) -> str:
+    lines = []
+    for idx, line in enumerate(text.splitlines()):
+        if line.strip():
+            lines.append({"line_number": idx + 1, "text": line.strip()})
+    wrapped = {"document": {"lines": lines}}
+    return json.dumps(wrapped, ensure_ascii=False, indent=2)
 
 # -------------------------------
 # PDF and OCR Processing Functions
@@ -243,9 +223,6 @@ def extract_table_from_image(img: Image.Image) -> dict:
             table[year][category] = value
     return table
 
-# -------------------------------
-# Specialized Table Extraction with pdfplumber
-# -------------------------------
 def extract_table_with_pdfplumber(pdf_path: str) -> dict:
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -275,57 +252,45 @@ def extract_table_with_pdfplumber(pdf_path: str) -> dict:
         return {}
 
 # -------------------------------
-# Hybrid Table Extraction using LayoutParser and OCR
+# Helper Functions for LayoutParser Extraction
 # -------------------------------
-def parse_table_text(table_text: str) -> dict:
-    lines = table_text.splitlines()
-    header_line = None
-    years = []
-    for i, line in enumerate(lines):
-        potential_years = re.findall(r'\b\d{4}\b', line)
-        if potential_years:
-            header_line = i
-            years = potential_years
-            break
-    if not years:
-        years = ["Ano Desconhecido"]
-    table = {year: {} for year in years}
-    for i, line in enumerate(lines):
-        if header_line is not None and i <= header_line:
-            continue
-        tokens = line.split()
-        if len(tokens) < 2:
-            continue
-        category = tokens[0]
-        for j, year in enumerate(years):
-            try:
-                value = float(tokens[j+1].replace(',', '.')) if j+1 < len(tokens) else math.nan
-            except Exception:
-                value = math.nan
-            table[year][category] = value
-    return table
-
-import os
-import logging
-
 def clean_checkpoint_path(original_path: str) -> str:
     """
-    If the checkpoint filename contains a query string (e.g., '?dl=1'),
-    rename the file to remove the query so that the checkpointer can load it.
+    If the checkpoint filename contains a query parameter (e.g., '?dl=1'),
+    copy the file to a new filename without the query so that the checkpointer can load it.
     """
     if '?' in original_path:
         new_path = original_path.split('?')[0]
         try:
-            # If a file already exists with the new name, remove it first
             if os.path.exists(new_path):
                 os.remove(new_path)
-            os.rename(original_path, new_path)
-            logging.info(f"Renamed checkpoint from {original_path} to {new_path}")
+            # Copy file contents from original_path to new_path
+            with open(original_path, 'rb') as src, open(new_path, 'wb') as dst:
+                dst.write(src.read())
+            logging.info(f"Copied checkpoint from {original_path} to {new_path}")
             return new_path
         except Exception as e:
-            logging.error(f"Failed to rename checkpoint file: {e}")
+            logging.error(f"Failed to clean checkpoint path: {e}")
             return original_path
     return original_path
+
+def parse_table_text(table_text: str) -> dict:
+    """
+    A simple parser for OCR text from a table.
+    Replace with your actual parsing logic as needed.
+    """
+    lines = table_text.splitlines()
+    table = {}
+    for line in lines:
+        tokens = line.split()
+        if len(tokens) >= 2:
+            key = tokens[0]
+            try:
+                value = float(tokens[1].replace(',', '.'))
+            except Exception:
+                value = None
+            table[key] = value
+    return table
 
 def extract_table_using_layoutparser(img: Image.Image) -> dict:
     """
@@ -342,11 +307,8 @@ def extract_table_using_layoutparser(img: Image.Image) -> dict:
             extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
             label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"}
         )
-        # Specify the expected checkpoint file path
         checkpoint_url = "/root/.torch/iopath_cache/s/dgy9c10wykk4lq4/model_final.pth?dl=1"
-        # Clean the checkpoint path (remove the query string)
         checkpoint_path = clean_checkpoint_path(checkpoint_url)
-        from detectron2.checkpoint import DetectionCheckpointer
         checkpointer = DetectionCheckpointer(model)
         checkpointer.load(checkpoint_path)
         layout = model.detect(image_np)
@@ -365,9 +327,6 @@ def extract_table_using_layoutparser(img: Image.Image) -> dict:
         logging.error(f"LayoutParser extraction failed: {e}")
         return {}
 
-# -------------------------------
-# Hybrid PDF Text and Table Extraction
-# -------------------------------
 def extract_text_and_table(pdf_path: str) -> (str, dict, str):
     raw_text = extract_text(pdf_path)
     wrapped_json = json.dumps({"document": {"lines": raw_text.splitlines()}}, ensure_ascii=False, indent=2)
@@ -380,13 +339,15 @@ def extract_text_and_table(pdf_path: str) -> (str, dict, str):
             if not table_data or not any(table_data.values()):
                 logging.info("Falling back to default table extraction with pytesseract.")
                 table_data = extract_table_from_image(first_page_img)
+            else:
+                logging.info("LayoutParser extraction succeeded.")
         except Exception as e:
             logging.error("Table extraction failed: %s", e)
             table_data = {}
     return wrapped_json, table_data, raw_text
 
 # -------------------------------
-# Company Info Extraction
+# Company Information Extraction
 # -------------------------------
 def extract_company_info(ocr_text: str, filename: str) -> dict:
     cnpj_pattern = r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}'
@@ -404,7 +365,7 @@ def extract_company_info(ocr_text: str, filename: str) -> dict:
     return {"company_name": company_name, "cnpj": cnpj}
 
 # -------------------------------
-# Checksum Validation Function
+# Checksum Validation
 # -------------------------------
 def validate_checksums(data: dict) -> dict:
     checksum_report = {}
@@ -423,7 +384,8 @@ def validate_checksums(data: dict) -> dict:
                         sum_ativo += value
                         ativo_found = True
             if ativo_found:
-                report["ativo"] = f"Checksum error: sum is {sum_ativo}, expected {ativo_total}." if abs(sum_ativo - ativo_total) > tolerance else "OK"
+                report["ativo"] = (f"Checksum error: sum is {sum_ativo}, expected {ativo_total}."
+                                   if abs(sum_ativo - ativo_total) > tolerance else "OK")
             else:
                 report["ativo"] = "No Ativo line items found for checksum validation"
         passivo_total = values.get("Passivo Total")
@@ -438,14 +400,15 @@ def validate_checksums(data: dict) -> dict:
                         sum_passivo += value
                         passivo_found = True
             if passivo_found:
-                report["passivo"] = f"Checksum error: sum is {sum_passivo}, expected {passivo_total}." if abs(sum_passivo - passivo_total) > tolerance else "OK"
+                report["passivo"] = (f"Checksum error: sum is {sum_passivo}, expected {passivo_total}."
+                                     if abs(sum_passivo - passivo_total) > tolerance else "OK")
             else:
                 report["passivo"] = "No Passivo line items found for checksum validation"
         checksum_report[year] = report
     return checksum_report
 
 # -------------------------------
-# API Integration Functions (if used)
+# API Integration (if needed)
 # -------------------------------
 def extract_json_from_text(text: str) -> str:
     candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
@@ -466,30 +429,6 @@ def extract_json_from_text(text: str) -> str:
             logging.error("Failed to decode JSON from candidate.")
             return None
     return None
-
-def format_financial_data(response_json: dict, categories: list) -> dict:
-    try:
-        content = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-        if not content.strip():
-            logging.error("Formatting error: API returned empty content.")
-            return None
-        json_text = extract_json_from_text(content)
-        if not json_text:
-            logging.error("Formatting error: Could not extract JSON content from the response.")
-            return None
-        raw_data = json.loads(json_text)
-        if any(key in categories for key in raw_data.keys()):
-            raw_data = {"Ano Desconhecido": raw_data}
-        formatted = {}
-        for year, data in raw_data.items():
-            formatted[year] = {}
-            for category in categories:
-                raw_value = data.get(category, math.nan)
-                formatted[year][category] = parse_value(raw_value)
-        return formatted
-    except Exception as e:
-        logging.error(f"Formatting error: {e}")
-        return None
 
 def parse_value(value) -> float:
     if value in [None, "NaN", ""]:
@@ -517,6 +456,30 @@ def parse_value(value) -> float:
         return float(value) * SCALE_FACTOR
     except Exception:
         return math.nan
+
+def format_financial_data(response_json: dict, categories: list) -> dict:
+    try:
+        content = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not content.strip():
+            logging.error("Formatting error: API returned empty content.")
+            return None
+        json_text = extract_json_from_text(content)
+        if not json_text:
+            logging.error("Formatting error: Could not extract JSON content from the response.")
+            return None
+        raw_data = json.loads(json_text)
+        if any(key in categories for key in raw_data.keys()):
+            raw_data = {"Ano Desconhecido": raw_data}
+        formatted = {}
+        for year, data in raw_data.items():
+            formatted[year] = {}
+            for category in categories:
+                raw_value = data.get(category, math.nan)
+                formatted[year][category] = parse_value(raw_value)
+        return formatted
+    except Exception as e:
+        logging.error(f"Formatting error: {e}")
+        return None
 
 def get_api_parameters(provider: str) -> tuple:
     if provider == "deepseek":
@@ -635,7 +598,7 @@ def analyze_document_in_batches(text_json: str, provider: str, categories: list,
         return None, "\n".join(logs)
 
 # -------------------------------
-# Flask HTML Templates (UPLOAD_HTML, RESULT_HTML, SEARCH_PAGE, SEARCH_RESULTS, RECORD_DETAIL)
+# Flask HTML Templates
 # -------------------------------
 UPLOAD_HTML = """
 <!doctype html>
@@ -970,33 +933,39 @@ def upload():
     json_text_path = os.path.join("output", f"{filename}_ocr.json")
     try:
         with open(json_text_path, "w", encoding="utf-8") as f:
-            f.write(wrapped_json)
-    except Exception as e:
-        logging.error("Error writing OCR JSON file: %s", e)
-    
-    result = table_data
-    batch_logs = "Hybrid table extraction completed."
-    
-download_analysis_link = None
-download_xls_link = None
-if result:
-    checksum_report = validate_checksums(result)
-    output_data = {
-        "financial_data": result,
-        "checksum_report": checksum_report
-    }
-    analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
-    try:
-        with open(analysis_json_path, "w", encoding="utf-8") as f:
             json.dump(
-                output_data,
+                json.loads(wrapped_json),
                 f,
                 indent=2,
                 ensure_ascii=False,
                 default=lambda x: None if isinstance(x, float) and math.isnan(x) else x
             )
     except Exception as e:
-        logging.error(f"Error writing analysis JSON file: {e}")
+        logging.error("Error writing OCR JSON file: %s", e)
+
+    result = table_data  # Use table extraction result
+    batch_logs = "Hybrid table extraction completed."
+    
+    download_analysis_link = None
+    download_xls_link = None
+    if result:
+        checksum_report = validate_checksums(result)
+        output_data = {
+            "financial_data": result,
+            "checksum_report": checksum_report
+        }
+        analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
+        try:
+            with open(analysis_json_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    output_data,
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                    default=lambda x: None if isinstance(x, float) and math.isnan(x) else x
+                )
+        except Exception as e:
+            logging.error("Error writing analysis JSON file: %s", e)
         
         try:
             with pd.ExcelWriter(os.path.join("output", f"{filename}_analysis.xlsx")) as writer:
@@ -1004,6 +973,7 @@ if result:
                 df_financial.index.name = "Year"
                 df_financial = df_financial.transpose()
                 df_financial.to_excel(writer, sheet_name="Financial Data")
+                
                 df_checksum = pd.DataFrame.from_dict(checksum_report, orient="index")
                 df_checksum.index.name = "Year"
                 df_checksum = df_checksum.transpose()
@@ -1037,10 +1007,6 @@ if result:
     finally:
         session.close()
     
-    @app.route("/upload", methods=["POST"])
-def upload():
-    # your processing code...
-    # Ensure all return statements are indented inside the function:
     return render_template_string(RESULT_HTML,
                                   filename=filename,
                                   download_analysis_link=download_analysis_link,
