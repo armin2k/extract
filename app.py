@@ -27,6 +27,9 @@ import camelot
 from tabula import read_pdf
 from layoutparser.models.detectron2 import Detectron2LayoutModel
 
+import logging
+logging.getLogger('org.apache.pdfbox').setLevel(logging.ERROR)
+
 # Load configuration and set up logging
 load_dotenv()
 APP_VERSION = "v1.0.2"
@@ -226,10 +229,10 @@ def extract_table_with_tabula(pdf_path: str) -> dict:
             years = header[1:]
             result = {year: {} for year in years}
             for _, row in df.iterrows():
-                category = row[0]
+                category = row.iloc[0]  # Use iloc for position-based access
                 for i, year in enumerate(years):
                     try:
-                        value = float(row[i+1].replace('.', '').replace(',', '.'))
+                        value = float(row.iloc[i+1].replace('.', '').replace(',', '.'))  # Use iloc here too
                     except:
                         value = math.nan
                     result[year][category] = value
@@ -927,7 +930,7 @@ def upload():
                     f,
                     indent=2,
                     ensure_ascii=False,
-                    default=lambda x: None if isinstance(x, float) and math.isnan(x) else x
+                    default=lambda x: None if isinstance(x, float) and math.isnan(x) else x  # Replace NaN with null
                 )
         except Exception as e:
             logging.error(f"Error writing analysis JSON file: {e}")
@@ -959,11 +962,13 @@ def upload():
     company_info = extract_company_info(raw_text, filename)
     session = SessionLocal()
     try:
+        # Replace NaN with None in result for database storage
+        db_analysis_data = json.loads(json.dumps(result, default=lambda x: None if isinstance(x, float) and math.isnan(x) else x))
         record = BalanceSheetAnalysis(
             filename=filename,
             company_name=company_info.get("company_name"),
             cnpj=company_info.get("cnpj"),
-            analysis_data=result if result else {},
+            analysis_data=db_analysis_data,
             ocr_data=json.loads(wrapped_json)
         )
         session.add(record)
