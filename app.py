@@ -8,48 +8,36 @@ import requests
 import pandas as pd
 import logging
 import concurrent.futures
-
-from flask import Flask, request, render_template_string, send_from_directory, url_for, redirect
-from werkzeug.utils import secure_filename
-from dotenv import load_dotenv
+import cv2
+import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 from pdf2image import convert_from_path
 from PyPDF2 import PdfReader
 import pytesseract
 from tenacity import retry, wait_exponential, stop_after_attempt
-
-# For image pre-processing enhancements
-import cv2
-import numpy as np
-
-# Import LayoutParser for table detection
-import layoutparser as lp
-
-# SQLAlchemy 2.0 imports
+from flask import Flask, request, render_template_string, send_from_directory, url_for, redirect
+from werkzeug.utils import secure_filename
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# -------------------------------
+# For table extraction
+import pdfplumber
+import camelot
+from tabula import read_pdf
+from layoutparser.models.detectron2 import Detectron2LayoutModel
+
 # Load configuration and set up logging
-# -------------------------------
 load_dotenv()
+APP_VERSION = "v1.0.2"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-APP_VERSION = "v1.0.1"  # Displayed in the browser footer
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-# Environment variables for external tools and database
 POPPLER_PATH = os.getenv("POPPLER_PATH", "/opt/homebrew/bin")
 SCALE_FACTOR = int(os.getenv("SCALE_FACTOR", 1))
 CATEGORIES_FILE = "categories.json"
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://armin@localhost/balancesheetdb")
 
-# -------------------------------
-# SQLAlchemy setup for 2.0
-# -------------------------------
+# SQLAlchemy Setup
 engine = create_engine(DATABASE_URL, future=True)
 SessionLocal = sessionmaker(engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
@@ -57,7 +45,7 @@ Base = declarative_base()
 class BalanceSheetAnalysis(Base):
     __tablename__ = "balance_sheet_analysis"
     id = Column(Integer, primary_key=True, index=True)
-    filename = Column(String, index=True)  # Original filename
+    filename = Column(String, index=True)
     company_name = Column(String, index=True)
     cnpj = Column(String, index=True)
     analysis_data = Column(JSON)
@@ -67,9 +55,7 @@ class BalanceSheetAnalysis(Base):
 with engine.begin() as conn:
     Base.metadata.create_all(conn)
 
-# -------------------------------
-# Load Categories and precompile regex patterns
-# -------------------------------
+# Load Categories
 def load_categories() -> list:
     try:
         with open(CATEGORIES_FILE, encoding="utf-8") as f:
@@ -82,9 +68,7 @@ def load_categories() -> list:
 CATEGORIES = load_categories()
 CATEGORY_PATTERNS = [(cat, re.compile(re.escape(cat), re.IGNORECASE)) for cat in CATEGORIES]
 
-# -------------------------------
 # Helper Functions for OCR Processing
-# -------------------------------
 def reorder_line(line: str, categories: list) -> str:
     found = None
     for cat, pattern in CATEGORY_PATTERNS:
@@ -105,10 +89,6 @@ def clean_ocr_text(raw_text: str, categories: list) -> str:
     return "\n".join(cleaned_lines)
 
 def wrap_text_in_json(text: str) -> str:
-    """
-    Wrap the given text in a JSON structure under "document" with a "lines" array.
-    Each non-empty line is stored as an object with its line number.
-    """
     lines = []
     for idx, line in enumerate(text.splitlines()):
         if line.strip():
@@ -117,12 +97,9 @@ def wrap_text_in_json(text: str) -> str:
     return json.dumps(wrapped, ensure_ascii=False, indent=2)
 
 def post_process_text(text: str) -> str:
-    text = re.sub(r'(?<=\d)O(?=\d)', '0', text)
-    return text
+    return re.sub(r'(?<=\d)O(?=\d)', '0', text)
 
-# -------------------------------
-# Advanced Image Pre‑processing Functions
-# -------------------------------
+# Advanced Image Pre-processing
 def deskew_image(img: Image.Image) -> Image.Image:
     try:
         img_np = np.array(img.convert('L'))
@@ -145,7 +122,10 @@ def deskew_image(img: Image.Image) -> Image.Image:
 
 def advanced_preprocess_image(img: Image.Image) -> Image.Image:
     img = deskew_image(img)
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(2.0)
     gray = np.array(img.convert('L'))
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
     thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                    cv2.THRESH_BINARY, 11, 2)
     kernel = np.ones((3, 3), np.uint8)
@@ -153,11 +133,137 @@ def advanced_preprocess_image(img: Image.Image) -> Image.Image:
     closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
     return Image.fromarray(closed)
 
-# -------------------------------
-# Functions to Use LayoutParser for Table Detection
-# -------------------------------
+# PDF and OCR Processing
+def extract_text(pdf_path: str) -> str:
+    text = ""
+    try:
+        with open(pdf_path, "rb") as f:
+            reader = PdfReader(f)
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                text += page_text + "\n"
+            if len(text.strip()) > 100:
+                return text
+    except Exception as e:
+        logging.error(f"Standard extraction failed: {e}")
+    try:
+        images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH, dpi=300)
+        ocr_text = []
+        custom_config = "--psm 12 --oem 3"
+        for idx, img in enumerate(images):
+            processed_img = advanced_preprocess_image(img)
+            text_img = pytesseract.image_to_string(processed_img, lang='por', config=custom_config)
+            text_img = post_process_text(text_img)
+            ocr_text.append(text_img)
+            logging.info(f"OCR completed for page {idx+1}.")
+        return "\n".join(ocr_text)
+    except Exception as e:
+        logging.error(f"OCR failed: {e}")
+        return ""
+
+# Table Extraction Functions
+def extract_table_with_pdfplumber(pdf_path: str) -> dict:
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            page = pdf.pages[0]
+            table_settings = {
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines",
+                "explicit_vertical_lines": [],
+                "explicit_horizontal_lines": []
+            }
+            table = page.extract_table(table_settings)
+            if table:
+                header = table[0]
+                if len(header) < 2:
+                    return {}
+                years = header[1:]
+                result = {year: {} for year in years}
+                for row in table[1:]:
+                    if len(row) < len(header):
+                        continue
+                    category = row[0]
+                    for i, year in enumerate(years):
+                        try:
+                            value = float(row[i+1].replace('.', '').replace(',', '.'))
+                        except Exception:
+                            value = math.nan
+                        result[year][category] = value
+                return result
+            return {}
+    except Exception as e:
+        logging.error(f"pdfplumber extraction failed: {e}")
+        return {}
+
+def extract_table_with_camelot(pdf_path: str) -> dict:
+    try:
+        tables = camelot.read_pdf(pdf_path, flavor='lattice')
+        if tables:
+            df = tables[0].df
+            header = df.iloc[0].tolist()
+            years = header[1:]
+            result = {year: {} for year in years}
+            for _, row in df[1:].iterrows():
+                category = row[0]
+                for i, year in enumerate(years):
+                    try:
+                        value = float(row[i+1].replace('.', '').replace(',', '.'))
+                    except:
+                        value = math.nan
+                    result[year][category] = value
+            return result
+        return {}
+    except Exception as e:
+        logging.error(f"Camelot extraction failed: {e}")
+        return {}
+
+def extract_table_with_tabula(pdf_path: str) -> dict:
+    try:
+        tables = read_pdf(pdf_path, pages='all', multiple_tables=True)
+        if tables:
+            df = tables[0]
+            header = df.columns.tolist()
+            years = header[1:]
+            result = {year: {} for year in years}
+            for _, row in df.iterrows():
+                category = row[0]
+                for i, year in enumerate(years):
+                    try:
+                        value = float(row[i+1].replace('.', '').replace(',', '.'))
+                    except:
+                        value = math.nan
+                    result[year][category] = value
+            return result
+        return {}
+    except Exception as e:
+        logging.error(f"Tabula extraction failed: {e}")
+        return {}
+
+def extract_table_using_layoutparser(img: Image.Image) -> dict:
+    try:
+        image_np = np.array(img)
+        model = Detectron2LayoutModel(
+            'lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config',
+            extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
+            label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"}
+        )
+        layout = model.detect(image_np)
+        table_blocks = [block for block in layout if block.type == "Table"]
+        if not table_blocks:
+            logging.info("No table detected with LayoutParser.")
+            return {}
+        table_blocks.sort(key=lambda b: b.area, reverse=True)
+        table_block = table_blocks[0]
+        cropped_np = table_block.crop(image_np)
+        cropped_img = Image.fromarray(cropped_np)
+        table_text = pytesseract.image_to_string(cropped_img, lang='por', config="--psm 12 --oem 3")
+        logging.info("LayoutParser OCR on detected table region completed.")
+        return parse_table_text(table_text)
+    except Exception as e:
+        logging.error(f"LayoutParser extraction failed: {e}")
+        return {}
+
 def parse_table_text(table_text: str) -> dict:
-    """Simple parser to extract a table from text. Expects header line with four-digit years."""
     lines = table_text.splitlines()
     header_line = None
     years = []
@@ -176,131 +282,40 @@ def parse_table_text(table_text: str) -> dict:
         tokens = line.split()
         if len(tokens) < 2:
             continue
-        category = tokens[0]
+        category = ' '.join(tokens[:-len(years)])
         for j, year in enumerate(years):
             try:
-                value = float(tokens[j+1].replace(',', '.')) if j+1 < len(tokens) else math.nan
-            except Exception:
+                value = clean_numeric_value(tokens[-len(years)+j])
+            except:
                 value = math.nan
             table[year][category] = value
     return table
 
-def extract_table_using_layoutparser(img: Image.Image) -> dict:
-    """Detect table regions using LayoutParser, crop the largest table, run OCR on it, and parse table text."""
-    image_np = np.array(img)
-    # Use a pre-trained model from PubLayNet for layout detection
-    model = lp.Detectron2LayoutModel(
-        'lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config',
-        extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
-        label_map={0:"Text", 1:"Title", 2:"List", 3:"Table", 4:"Figure"}
-    )
-    layout = model.detect(image_np)
-    table_blocks = [block for block in layout if block.type == "Table"]
-    if not table_blocks:
-        logging.info("No table detected using LayoutParser.")
-        return {}
-    # Take the largest table block
-    table_blocks.sort(key=lambda b: b.area, reverse=True)
-    table_block = table_blocks[0]
-    cropped_np = table_block.crop(image_np)
-    cropped_img = Image.fromarray(cropped_np)
-    # Run OCR on the cropped table region
-    table_text = pytesseract.image_to_string(cropped_img, lang='por', config="--psm 6")
-    logging.info("LayoutParser OCR on table region completed.")
-    table_data = parse_table_text(table_text)
-    return table_data
-
-# -------------------------------
-# PDF and OCR Processing Functions
-# -------------------------------
-def extract_text(pdf_path: str) -> str:
-    text = ""
+def clean_numeric_value(value: str) -> float:
+    value = re.sub(r'[^\d.,()-]', '', value)
+    value = value.replace('.', '').replace(',', '.')
+    if value.startswith('(') and value.endswith(')'):
+        value = '-' + value[1:-1]
     try:
-        with open(pdf_path, "rb") as f:
-            reader = PdfReader(f)
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                text += page_text + "\n"
-            if len(text.strip()) > 100:
-                return text
-    except Exception as e:
-        logging.error(f"Standard extraction failed: {e}")
-    try:
-        images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH, dpi=300)
-        ocr_text = []
-        custom_config = "--psm 6 --oem 3"
-        for idx, img in enumerate(images):
-            processed_img = advanced_preprocess_image(img)
-            text_img = pytesseract.image_to_string(processed_img, lang='por', config=custom_config)
-            text_img = post_process_text(text_img)
-            ocr_text.append(text_img)
-            logging.info(f"OCR completed for page {idx+1}.")
-        return "\n".join(ocr_text)
-    except Exception as e:
-        logging.error(f"OCR failed: {e}")
-        return ""
+        return float(value)
+    except:
+        return math.nan
 
-def extract_table_from_image(img: Image.Image) -> dict:
-    # Fallback table extraction method using pytesseract image_to_data
-    data = pytesseract.image_to_data(img, lang='por', config="--psm 6", output_type=pytesseract.Output.DICT)
-    n_boxes = len(data['text'])
-    lines = {}
-    for i in range(n_boxes):
-        word = data['text'][i].strip()
-        if not word:
-            continue
-        ln = data['line_num'][i]
-        if ln not in lines:
-            lines[ln] = []
-        lines[ln].append((data['left'][i], word))
-    for ln in lines:
-        lines[ln].sort(key=lambda x: x[0])
-        lines[ln] = " ".join([w for _, w in lines[ln]])
-    header_line = None
-    years = []
-    for ln in sorted(lines.keys()):
-        potential_years = re.findall(r'\b\d{4}\b', lines[ln])
-        if potential_years:
-            header_line = ln
-            years = potential_years
-            break
-    if not years:
-        years = ["Ano Desconhecido"]
-    table = {year: {} for year in years}
-    for ln in sorted(lines.keys()):
-        if header_line and ln <= header_line:
-            continue
-        tokens = lines[ln].split()
-        if len(tokens) < 2:
-            continue
-        category = tokens[0]
-        for i, year in enumerate(years):
-            try:
-                value = float(tokens[i+1].replace(',', '.')) if i+1 < len(tokens) else math.nan
-            except Exception:
-                value = math.nan
-            table[year][category] = value
-    return table
-
-def perform_analysis_local(pdf_path: str) -> (str, dict, str):
+def extract_text_and_table(pdf_path: str) -> (str, dict, str):
     raw_text = extract_text(pdf_path)
     wrapped_json = json.dumps({"document": {"lines": raw_text.splitlines()}}, ensure_ascii=False, indent=2)
-    try:
+    table_data = extract_table_with_pdfplumber(pdf_path)
+    if not table_data or not any(table_data.values()):
+        table_data = extract_table_with_camelot(pdf_path)
+    if not table_data or not any(table_data.values()):
+        table_data = extract_table_with_tabula(pdf_path)
+    if not table_data or not any(table_data.values()):
         images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH, dpi=300)
         first_page_img = advanced_preprocess_image(images[0])
-        # First, try using LayoutParser for table detection.
         table_data = extract_table_using_layoutparser(first_page_img)
-        if not table_data:
-            logging.info("Falling back to default table extraction.")
-            table_data = extract_table_from_image(first_page_img)
-    except Exception as e:
-        logging.error("Table extraction failed: %s", e)
-        table_data = {}
     return wrapped_json, table_data, raw_text
 
-# -------------------------------
 # Company Info Extraction
-# -------------------------------
 def extract_company_info(ocr_text: str, filename: str) -> dict:
     cnpj_pattern = r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}'
     cnpj_match = re.search(cnpj_pattern, ocr_text)
@@ -313,15 +328,10 @@ def extract_company_info(ocr_text: str, filename: str) -> dict:
     else:
         base = os.path.splitext(filename)[0]
         fallback_match = re.search(r'^([^\d]+)', base)
-        if fallback_match:
-            company_name = fallback_match.group(1).strip()
-        else:
-            company_name = base.strip()
+        company_name = fallback_match.group(1).strip() if fallback_match else base.strip()
     return {"company_name": company_name, "cnpj": cnpj}
 
-# -------------------------------
-# Checksum Validation Function
-# -------------------------------
+# Checksum Validation
 def validate_checksums(data: dict) -> dict:
     checksum_report = {}
     tolerance = 0.01
@@ -331,44 +341,18 @@ def validate_checksums(data: dict) -> dict:
         if ativo_total is None or math.isnan(ativo_total):
             report["ativo"] = "Ativo Total is missing or NaN"
         else:
-            sum_ativo = 0.0
-            ativo_found = False
-            for key, value in values.items():
-                if key.startswith("Ativo") and key != "Ativo Total":
-                    if not math.isnan(value):
-                        sum_ativo += value
-                        ativo_found = True
-            if ativo_found:
-                if abs(sum_ativo - ativo_total) > tolerance:
-                    report["ativo"] = f"Checksum error: sum of Ativo items is {sum_ativo}, expected {ativo_total}."
-                else:
-                    report["ativo"] = "OK"
-            else:
-                report["ativo"] = "No Ativo line items found for checksum validation"
+            sum_ativo = sum(value for key, value in values.items() if key.startswith("Ativo") and key != "Ativo Total" and not math.isnan(value))
+            report["ativo"] = f"Checksum error: sum is {sum_ativo}, expected {ativo_total}." if abs(sum_ativo - ativo_total) > tolerance else "OK"
         passivo_total = values.get("Passivo Total")
         if passivo_total is None or math.isnan(passivo_total):
             report["passivo"] = "Passivo Total is missing or NaN"
         else:
-            sum_passivo = 0.0
-            passivo_found = False
-            for key, value in values.items():
-                if key.startswith("Passivo") and key != "Passivo Total":
-                    if not math.isnan(value):
-                        sum_passivo += value
-                        passivo_found = True
-            if passivo_found:
-                if abs(sum_passivo - passivo_total) > tolerance:
-                    report["passivo"] = f"Checksum error: sum of Passivo items is {sum_passivo}, expected {passivo_total}."
-                else:
-                    report["passivo"] = "OK"
-            else:
-                report["passivo"] = "No Passivo line items found for checksum validation"
+            sum_passivo = sum(value for key, value in values.items() if key.startswith("Passivo") and key != "Passivo Total" and not math.isnan(value))
+            report["passivo"] = f"Checksum error: sum is {sum_passivo}, expected {passivo_total}." if abs(sum_passivo - passivo_total) > tolerance else "OK"
         checksum_report[year] = report
     return checksum_report
 
-# -------------------------------
-# API Integration Functions (if used)
-# -------------------------------
+# API Integration
 def extract_json_from_text(text: str) -> str:
     candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     for candidate in candidates:
@@ -437,7 +421,7 @@ def parse_value(value) -> float:
         return num * SCALE_FACTOR
     try:
         return float(value) * SCALE_FACTOR
-    except Exception:
+    except:
         return math.nan
 
 def get_api_parameters(provider: str) -> tuple:
@@ -470,8 +454,26 @@ Extraia somente os dados financeiros relevantes, convertendo "1.234,56" para 123
 Se houver dados de múltiplos anos, utilize os anos (4 dígitos) como chaves; caso contrário, utilize "Ano Desconhecido".
 Retorne APENAS um objeto JSON com os valores extraídos.
 
+Exemplo de entrada:
+{{
+    "document": {{
+        "lines": [
+            {{ "line_number": 1, "text": "Ativo Total 2022 10.000,00" }},
+            {{ "line_number": 2, "text": "Passivo Total 2022 (5.000,00)" }}
+        ]
+    }}
+}}
+
+Exemplo de saída:
+{{
+    "2022": {{
+        "Ativo Total": 10000.00,
+        "Passivo Total": -5000.00
+    }}
+}}
+
 Categorias:
-{json.dumps(CATEGORIES, indent=4, ensure_ascii=False)}
+{json.dumps(categories, indent=4, ensure_ascii=False)}
 
 Documento (em JSON):
 {text_json}
@@ -484,7 +486,7 @@ Documento (em JSON):
     }
     try:
         response_json = make_api_call(url, headers, payload, timeout_value)
-        return format_financial_data(response_json, CATEGORIES)
+        return format_financial_data(response_json, categories)
     except Exception as e:
         logging.error(f"API Error: {e}")
         return None
@@ -534,7 +536,7 @@ def analyze_document_in_batches(text_json: str, provider: str, categories: list,
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_index = {
-            executor.submit(analyze_with_api, wrap_text_in_json(batch), provider, CATEGORIES): i+1
+            executor.submit(analyze_with_api, wrap_text_in_json(batch), provider, categories): i+1
             for i, batch in enumerate(batches)
         }
         for future in concurrent.futures.as_completed(future_to_index):
@@ -549,16 +551,14 @@ def analyze_document_in_batches(text_json: str, provider: str, categories: list,
             except Exception as exc:
                 logs.append(f"Batch {i} generated an exception: {exc}")
     if results:
-        merged_result = merge_analysis_results(results, CATEGORIES)
+        merged_result = merge_analysis_results(results, categories)
         logs.append("Merged results from batches successfully.")
         return merged_result, "\n".join(logs)
     else:
         logs.append("No results were obtained from any batches.")
         return None, "\n".join(logs)
 
-# -------------------------------
 # Flask HTML Templates
-# -------------------------------
 UPLOAD_HTML = """
 <!doctype html>
 <html lang="en">
@@ -588,7 +588,7 @@ UPLOAD_HTML = """
   <h2>Balance Sheet Analyzer - Upload a PDF</h2>
   <form method="post" enctype="multipart/form-data" action="/upload" onsubmit="showProgress()">
     <label for="file">Select a Balance Sheet PDF:</label>
-    <input type="file" name="file" id="file">
+    <input type="file" name="file" id="file" accept=".pdf">
     <label for="provider">Select API Provider:</label>
     <select name="provider" id="provider">
       <option value="chatgpt">ChatGPT API (gpt-4o-mini)</option>
@@ -747,7 +747,6 @@ RECORD_DETAIL = """
     .navbar a { float: left; display: block; color: #f2f2f2; text-align: center; padding: 14px 16px; text-decoration: none; }
     .navbar a:hover { background-color: #ddd; color: black; }
     .container { width: 90%; margin: 50px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-    /* Tab styling */
     .tab { overflow: hidden; border-bottom: 1px solid #ccc; }
     .tab button { background-color: inherit; float: left; border: none; outline: none; cursor: pointer; padding: 14px 16px; transition: 0.3s; font-size: 17px; }
     .tab button:hover { background-color: #ddd; }
@@ -788,13 +787,11 @@ RECORD_DETAIL = """
   <p><strong>CNPJ:</strong> {{ record.cnpj }}</p>
   <p><strong>Last Updated:</strong> {{ record.created_at }}</p>
   
-  <!-- Tab navigation -->
   <div class="tab">
     <button class="tablinks" onclick="openTab(event, 'balance')">Balance Sheet</button>
     <button class="tablinks" onclick="openTab(event, 'checksum')">Checksum</button>
   </div>
   
-  <!-- Balance Sheet Tab -->
   <div id="balance" class="tabcontent">
     <h3>Extracted Balance Sheet Information</h3>
     {% if analysis and sorted_years %}
@@ -819,7 +816,6 @@ RECORD_DETAIL = """
     {% endif %}
   </div>
   
-  <!-- Checksum Tab -->
   <div id="checksum" class="tabcontent">
     <h3>Checksum Information</h3>
     {% if checksum and sorted_years %}
@@ -862,9 +858,7 @@ RECORD_DETAIL = """
 </html>
 """
 
-# -------------------------------
-# Flask Routes
-# -------------------------------
+# Flask App
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -885,31 +879,26 @@ def upload():
         return "Only PDF files are allowed.", 400
 
     provider = request.form.get("provider", "chatgpt")
-    filename = secure_filename(file.filename)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename_base = secure_filename(file.filename)
+    filename = f"{timestamp}_{filename_base}"
     upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(upload_path)
-    
     logging.info("File %s saved to %s", filename, upload_path)
 
-    raw_text = extract_text(upload_path)
+    wrapped_json, table_data, raw_text = extract_text_and_table(upload_path)
     cleaned_text = clean_ocr_text(raw_text, CATEGORIES)
     wrapped_json = wrap_text_in_json(cleaned_text)
-    
     json_text_path = os.path.join("output", f"{filename}_ocr.json")
     try:
         with open(json_text_path, "w", encoding="utf-8") as f:
             f.write(wrapped_json)
     except Exception as e:
         logging.error("Error writing OCR JSON file: %s", e)
-    
-    if len(cleaned_text) > 10000:
-        result, batch_logs = analyze_document_in_batches(wrapped_json, provider, CATEGORIES, batch_size=10000, overlap_lines=3)
-    else:
-        result = analyze_with_api(wrapped_json, provider, CATEGORIES)
-        batch_logs = "Single API call used (no batch processing)."
-    
-    download_analysis_link = None
-    download_xls_link = None
+
+    result = table_data
+    batch_logs = "Hybrid table extraction completed."
+
     if result:
         checksum_report = validate_checksums(result)
         output_data = {
@@ -919,33 +908,41 @@ def upload():
         analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
         try:
             with open(analysis_json_path, "w", encoding="utf-8") as f:
-                json.dump(output_data, f, indent=2, ensure_ascii=False, default=lambda x: "NaN" if math.isnan(x) else x)
+                json.dump(
+                    output_data,
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                    default=lambda x: None if isinstance(x, float) and math.isnan(x) else x
+                )
         except Exception as e:
-            logging.error("Error writing analysis JSON file: %s", e)
-        
+            logging.error(f"Error writing analysis JSON file: {e}")
+            batch_logs += f"\nError writing analysis JSON file: {e}"
+
         try:
             with pd.ExcelWriter(os.path.join("output", f"{filename}_analysis.xlsx")) as writer:
                 df_financial = pd.DataFrame.from_dict(result, orient="index")
                 df_financial.index.name = "Year"
                 df_financial = df_financial.transpose()
                 df_financial.to_excel(writer, sheet_name="Financial Data")
-                
                 df_checksum = pd.DataFrame.from_dict(checksum_report, orient="index")
                 df_checksum.index.name = "Year"
                 df_checksum = df_checksum.transpose()
                 df_checksum.to_excel(writer, sheet_name="Checksum Report")
         except Exception as e:
-            logging.error("Error writing analysis XLS file: %s", e)
-        
+            logging.error(f"Error writing analysis XLS file: {e}")
+            batch_logs += f"\nError writing analysis XLS file: {e}"
+
         download_analysis_link = url_for("download_file", filename=f"{filename}_analysis.json")
         download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
         download_xls_link = url_for("download_file", filename=f"{filename}_analysis.xlsx")
     else:
         download_ocr_link = url_for("download_file", filename=f"{filename}_ocr.json")
         batch_logs += "\nNo analysis result obtained."
+        download_analysis_link = None
+        download_xls_link = None
 
     company_info = extract_company_info(raw_text, filename)
-
     session = SessionLocal()
     try:
         record = BalanceSheetAnalysis(
@@ -961,9 +958,10 @@ def upload():
     except Exception as e:
         session.rollback()
         logging.error("Error saving record to DB: %s", e)
+        batch_logs += f"\nError saving record to DB: {e}"
     finally:
         session.close()
-    
+
     return render_template_string(RESULT_HTML,
                                   filename=filename,
                                   download_analysis_link=download_analysis_link,
