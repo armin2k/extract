@@ -1037,6 +1037,10 @@ if result:
     finally:
         session.close()
     
+    @app.route("/upload", methods=["POST"])
+def upload():
+    # your processing code...
+    # Ensure all return statements are indented inside the function:
     return render_template_string(RESULT_HTML,
                                   filename=filename,
                                   download_analysis_link=download_analysis_link,
