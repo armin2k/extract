@@ -239,6 +239,15 @@ def extract_table_with_tabula(pdf_path: str) -> dict:
         logging.error(f"Tabula extraction failed: {e}")
         return {}
 
+ef clean_checkpoint_path(original_path: str) -> str:
+    if '?' in original_path:
+        new_path = original_path.split('?')[0]
+        if not os.path.exists(new_path):
+            import shutil
+            shutil.copy(original_path, new_path)
+        return new_path
+    return original_path
+
 def extract_table_using_layoutparser(img: Image.Image) -> dict:
     try:
         image_np = np.array(img)
@@ -247,6 +256,11 @@ def extract_table_using_layoutparser(img: Image.Image) -> dict:
             extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
             label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"}
         )
+        checkpoint_path = "/root/.torch/iopath_cache/s/dgy9c10wykk4lq4/model_final.pth?dl=1"
+        cleaned_path = clean_checkpoint_path(checkpoint_path)
+        from detectron2.checkpoint import DetectionCheckpointer
+        checkpointer = DetectionCheckpointer(model)
+        checkpointer.load(cleaned_path)
         layout = model.detect(image_np)
         table_blocks = [block for block in layout if block.type == "Table"]
         if not table_blocks:
