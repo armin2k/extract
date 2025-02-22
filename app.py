@@ -22,7 +22,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 import cv2
 import numpy as np
 
-# Specialized table extraction
+# For table extraction from PDFs (fallback)
 import pdfplumber
 
 # LayoutParser (Detectron2-based table extraction)
@@ -33,7 +33,7 @@ except ImportError:
     Detectron2LayoutModel = None
     logging.error("Detectron2LayoutModel not available. LayoutParser extraction will be skipped.")
 
-# SQLAlchemy setup
+# SQLAlchemy setup for PostgreSQL integration
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -42,7 +42,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # -------------------------------
 load_dotenv()
 
-APP_VERSION = "v1.0.1"  # Displayed in the browser footer
+APP_VERSION = "v1.0.1"  # Displayed in browser footer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,6 +152,17 @@ def wrap_text_in_json(text: str) -> str:
     wrapped = {"document": {"lines": lines}}
     return json.dumps(wrapped, ensure_ascii=False, indent=2)
 
+# Recursive function to replace NaN with None
+def sanitize_data(obj):
+    if isinstance(obj, dict):
+        return {k: sanitize_data(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_data(x) for x in obj]
+    elif isinstance(obj, float):
+        return None if math.isnan(obj) else obj
+    else:
+        return obj
+
 # -------------------------------
 # PDF and OCR Processing Functions
 # -------------------------------
@@ -251,54 +262,13 @@ def extract_table_with_pdfplumber(pdf_path: str) -> dict:
         logging.error(f"pdfplumber extraction failed: {e}")
         return {}
 
-# -------------------------------
-# Helper Functions for LayoutParser Extraction
-# -------------------------------
-def clean_checkpoint_path(original_path: str) -> str:
-    """
-    If the checkpoint filename contains a query parameter (e.g., '?dl=1'),
-    copy the file to a new filename without the query so that the checkpointer can load it.
-    """
-    if '?' in original_path:
-        new_path = original_path.split('?')[0]
-        try:
-            if os.path.exists(new_path):
-                os.remove(new_path)
-            # Copy file contents from original_path to new_path
-            with open(original_path, 'rb') as src, open(new_path, 'wb') as dst:
-                dst.write(src.read())
-            logging.info(f"Copied checkpoint from {original_path} to {new_path}")
-            return new_path
-        except Exception as e:
-            logging.error(f"Failed to clean checkpoint path: {e}")
-            return original_path
-    return original_path
-
-def parse_table_text(table_text: str) -> dict:
-    """
-    A simple parser for OCR text from a table.
-    Replace with your actual parsing logic as needed.
-    """
-    lines = table_text.splitlines()
-    table = {}
-    for line in lines:
-        tokens = line.split()
-        if len(tokens) >= 2:
-            key = tokens[0]
-            try:
-                value = float(tokens[1].replace(',', '.'))
-            except Exception:
-                value = None
-            table[key] = value
-    return table
-
 def extract_table_using_layoutparser(img: Image.Image) -> dict:
     """
-    Use LayoutParser (Detectron2-based model) to detect a table region in the image,
+    Use LayoutParser (Detectron2-based model) to detect a table region,
     then run OCR on that region and parse the table text.
     """
     if Detectron2LayoutModel is None:
-        logging.error("Detectron2LayoutModel is not available. Skipping LayoutParser extraction.")
+        logging.error("Detectron2LayoutModel not available. Skipping LayoutParser extraction.")
         return {}
     try:
         image_np = np.array(img)
@@ -307,8 +277,21 @@ def extract_table_using_layoutparser(img: Image.Image) -> dict:
             extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
             label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"}
         )
+        # Use the checkpoint URL from cache (contains ?dl=1)
         checkpoint_url = "/root/.torch/iopath_cache/s/dgy9c10wykk4lq4/model_final.pth?dl=1"
-        checkpoint_path = clean_checkpoint_path(checkpoint_url)
+        # Remove query parameters by renaming the file
+        checkpoint_path = checkpoint_url.split('?')[0]
+        if os.path.exists(checkpoint_url):
+            try:
+                if os.path.exists(checkpoint_path):
+                    os.remove(checkpoint_path)
+                os.rename(checkpoint_url, checkpoint_path)
+                logging.info(f"Renamed checkpoint from {checkpoint_url} to {checkpoint_path}")
+            except Exception as e:
+                logging.error(f"Failed to rename checkpoint file: {e}")
+        else:
+            logging.error(f"Checkpoint file not found at {checkpoint_url}")
+        from detectron2.checkpoint import DetectionCheckpointer
         checkpointer = DetectionCheckpointer(model)
         checkpointer.load(checkpoint_path)
         layout = model.detect(image_np)
@@ -326,6 +309,20 @@ def extract_table_using_layoutparser(img: Image.Image) -> dict:
     except Exception as e:
         logging.error(f"LayoutParser extraction failed: {e}")
         return {}
+
+def parse_table_text(table_text: str) -> dict:
+    lines = table_text.splitlines()
+    table = {}
+    for line in lines:
+        tokens = line.split()
+        if len(tokens) >= 2:
+            key = tokens[0]
+            try:
+                value = float(tokens[1].replace(',', '.'))
+            except Exception:
+                value = None
+            table[key] = value
+    return table
 
 def extract_text_and_table(pdf_path: str) -> (str, dict, str):
     raw_text = extract_text(pdf_path)
@@ -408,7 +405,7 @@ def validate_checksums(data: dict) -> dict:
     return checksum_report
 
 # -------------------------------
-# API Integration (if needed)
+# API Integration Functions (if needed)
 # -------------------------------
 def extract_json_from_text(text: str) -> str:
     candidates = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
@@ -954,6 +951,8 @@ def upload():
             "financial_data": result,
             "checksum_report": checksum_report
         }
+        # Sanitize output_data to replace NaN with null
+        output_data = sanitize_data(output_data)
         analysis_json_path = os.path.join("output", f"{filename}_analysis.json")
         try:
             with open(analysis_json_path, "w", encoding="utf-8") as f:
@@ -961,8 +960,7 @@ def upload():
                     output_data,
                     f,
                     indent=2,
-                    ensure_ascii=False,
-                    default=lambda x: None if isinstance(x, float) and math.isnan(x) else x
+                    ensure_ascii=False
                 )
         except Exception as e:
             logging.error("Error writing analysis JSON file: %s", e)
